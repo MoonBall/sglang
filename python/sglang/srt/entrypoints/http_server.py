@@ -63,6 +63,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
     VertexGenerateReqInput,
+    SaveWeightToEicReqInput,
 )
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.metrics.func_timer import enable_func_timer
@@ -543,6 +544,27 @@ async def parse_function_call_request(obj: ParseFunctionCallReq, request: Reques
 
     return ORJSONResponse(content=response_data, status_code=200)
 
+@app.post("/save_weight_to_eic")
+async def save_weight_to_eic(obj: SaveWeightToEicReqInput, request: Request):
+    """save the weights to disk."""
+    success, message = await _global_state.tokenizer_manager.save_weight_to_eic(
+        obj, request
+    )
+    if success:
+        content = {"success": success, "message": "save weight to eic started."}
+    else:
+        content = {"success": success, "message": message}
+
+    if success:
+        return ORJSONResponse(
+            content,
+            status_code=HTTPStatus.OK,
+        )
+    else:
+        return ORJSONResponse(
+            content,
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
 
 @app.post("/separate_reasoning")
 async def separate_reasoning_request(obj: SeparateReasoningReqInput, request: Request):

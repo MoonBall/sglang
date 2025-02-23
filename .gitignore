@@ -227,3 +227,6 @@ compile_commands.json
 .vscode
 
 1
+# docker
+docker/eic*
+docker/config

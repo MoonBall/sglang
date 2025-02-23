@@ -178,6 +178,7 @@ class ServerArgs:
     enable_custom_logit_processor: bool = False
     tool_call_parser: Optional[str] = None
     enable_hierarchical_cache: bool = False
+    enable_eic_cache: bool = False
     hicache_ratio: float = 2.0
     hicache_size: int = 0
     hicache_write_policy: str = "write_through_selective"
@@ -187,6 +188,8 @@ class ServerArgs:
     n_share_experts_fusion: int = 0
     disable_chunked_prefix_cache: bool = False
     disable_fast_image_processor: bool = False
+
+    eic_model_path: str = None
 
     # Debug tensor dumps
     debug_tensor_dump_output_folder: Optional[str] = None
@@ -412,6 +415,9 @@ class ServerArgs:
             "1" if self.disable_outlines_disk_cache else "0"
         )
 
+        if self.enable_eic_cache and not self.enable_hierarchical_cache:
+            self.enable_hierarchical_cache = True
+
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
         # Model and port args
@@ -483,7 +489,8 @@ class ServerArgs:
             "quantization."
             '"layered" loads weights layer by layer so that one can quantize a '
             "layer before loading another to make the peak memory envelope "
-            "smaller.",
+            "smaller."
+            '"eic" will load the weights from eic cache.',
         )
         parser.add_argument(
             "--trust-remote-code",
@@ -1222,6 +1229,12 @@ class ServerArgs:
             help="Inject the outputs from jax as the input of every layer.",
         )
 
+        parser.add_argument(
+            "--enable-eic-cache",
+            action="store_true",
+            help="Enable EIC cache",
+        )
+
         # Disaggregation
         parser.add_argument(
             "--disaggregation-mode",
@@ -1248,6 +1261,13 @@ class ServerArgs:
             type=str,
             default=ServerArgs.disaggregation_ib_device,
             help="The ib device for disaggregation transfer. Default is None, it will be detected automatically if using the mooncake backend.",
+        )
+
+        parser.add_argument(
+            "--eic-model-path",
+            type=str,
+            default=ServerArgs.eic_model_path,
+            help="The path of the EIC model, which is automatically set by model-path if not specified.",
         )
 
     @classmethod

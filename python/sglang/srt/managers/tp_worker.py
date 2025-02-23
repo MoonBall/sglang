@@ -29,6 +29,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+    SaveWeightToEicReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, global_server_args_dict
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool, TokenToKVPoolAllocator
@@ -76,6 +77,7 @@ class TpModelWorker:
             dtype=server_args.dtype,
             quantization=server_args.quantization,
             is_draft_model=is_draft_worker,
+            eic_model_path=server_args.eic_model_path,
         )
 
         self.model_runner = ModelRunner(
@@ -225,6 +227,13 @@ class TpModelWorker:
         logits_output = self.model_runner.forward(forward_batch)
         embeddings = logits_output.embeddings
         return embeddings
+
+    def save_weight_to_eic(self, recv_req: SaveWeightToEicReqInput):
+        success, message = self.model_runner.save_weight_to_eic(
+            recv_req.local_path,
+            recv_req.model_path,
+        )
+        return success, message
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.model_runner.update_weights_from_disk(

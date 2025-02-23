@@ -48,11 +48,13 @@ class ModelConfig:
         quantization: Optional[str] = None,
         override_config_file: Optional[str] = None,
         is_draft_model: bool = False,
+        eic_model_path: Optional[str] = None,
     ) -> None:
 
         self.model_path = model_path
         self.revision = revision
         self.quantization = quantization
+        self.eic_model_path = eic_model_path
 
         # Parse args
         self.maybe_pull_model_tokenizer_from_remote()

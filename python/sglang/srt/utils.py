@@ -1658,7 +1658,6 @@ def debug_timing(func):
 
     return wrapper
 
-
 def nullable_str(val: str):
     if not val or val == "None":
         return None

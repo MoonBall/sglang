@@ -488,6 +488,8 @@ def _set_envs_and_config(server_args: ServerArgs):
     # Set mp start method
     mp.set_start_method("spawn", force=True)
 
+def is_eic(model_or_path: str):
+    return model_or_path.lower().startswith('eic://')
 
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: Optional[PortArgs] = None
@@ -509,6 +511,14 @@ def _launch_subprocesses(
     server_args.model_path, server_args.tokenizer_path = prepare_model_and_tokenizer(
         server_args.model_path, server_args.tokenizer_path
     )
+
+    # If using model from eic, first download the model.
+    if is_eic(server_args.model_path):
+        server_args.eic_model_path = server_args.model_path.removeprefix(
+            "eic://")
+        server_args.model_path, server_args.tokenizer_path = _prepare_model_and_tokenizer_from_eic(
+            server_args.eic_model_path
+        )
 
     scheduler_procs = []
     if server_args.dp_size == 1:

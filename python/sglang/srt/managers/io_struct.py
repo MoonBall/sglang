@@ -681,6 +681,17 @@ class BatchEmbeddingOut:
 class FlushCacheReqInput:
     pass
 
+@dataclass
+class SaveWeightToEicReqInput:
+    # Local model path
+    local_path: str
+    # The model path to save model
+    model_path: str
+
+@dataclass
+class SaveWeightToEicReqOutput:
+    success: bool
+    message: str
 
 @dataclass
 class FlushCacheReqOutput:

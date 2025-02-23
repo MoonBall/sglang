@@ -514,6 +514,18 @@ class ModelRunner:
             raise ValueError(
                 f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
+    def save_weight_to_eic(self, local_path: str, model_path: str) -> tuple[bool, str]:
+        """Save engine weights to the EIC."""
+        from sglang.srt.model_loader.loader import EICModelLoader
+        logger.info(
+            f"start to save weights to eic, local_path={local_path}, model_path={model_path}"
+        )
+        EICModelLoader.save_model(
+            self.model,
+            local_path=local_path,
+            model_path=model_path,
+        )
+        return True, f"success on TP{self.tp_rank}"
 
     def update_weights_from_disk(
         self, model_path: str, load_format: str

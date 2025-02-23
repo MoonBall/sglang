@@ -29,6 +29,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromTensorReqInput,
+    SaveWeightToEicReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -224,6 +225,10 @@ class TpModelWorkerClient:
             self.future_token_ids_ct + bs
         ) % self.future_token_ids_limit
         return None, future_next_token_ids
+
+    def save_weight_to_eic(self, recv_req: SaveWeightToEicReqInput):
+        success, message = self.worker.save_weight_to_eic(recv_req)
+        return success, message
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         success, message = self.worker.update_weights_from_disk(recv_req)

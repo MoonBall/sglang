@@ -94,6 +94,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    SaveWeightToEicReqInput,
+    SaveWeightToEicReqOutput,
 )
 from sglang.srt.managers.multimodal_processor import (
     get_dummy_processor,
@@ -231,6 +233,11 @@ class TokenizerManager:
         )
         self.asyncio_tasks = set()
 
+        # For eic model sync
+        self.save_eic_model_result: Optional[Awaitable[SaveWeightToEicReqOutput]] = (
+            None
+        )
+
         # For session info
         self.session_futures = {}  # session_id -> asyncio event
 
@@ -335,6 +342,9 @@ class TokenizerManager:
                     self.expert_distribution_communicator.handle_recv,
                 ),
                 (HealthCheckOutput, lambda x: None),
+                (   SaveWeightToEicReqOutput,
+                    self._save_eic_model_result,
+                ),
             ]
         )
 
@@ -1249,6 +1259,15 @@ class TokenizerManager:
             if len(self.model_update_tmp) == self.server_args.dp_size:
                 self.model_update_result.set_result(self.model_update_tmp)
 
+    def _save_eic_model_result(self, recv_obj):
+        logger.info(f"get save eic result, result={recv_obj}")
+        if self.server_args.dp_size == 1:
+            self.save_eic_model_result.set_result(recv_obj)
+        else:  # self.server_args.dp_size > 1
+            self.save_eic_tmp.append(recv_obj)
+            # set future if the all results are received
+            if len(self.save_eic_tmp) == self.server_args.dp_size:
+                self.save_eic_model_result.set_result(self.save_eic_tmp)
 
 async def print_exception_wrapper(func):
     """
