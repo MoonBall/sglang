@@ -8,17 +8,16 @@ import torch
 
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
-    MHATokenToKVPoolHost,
     MLATokenToKVPool,
-    MLATokenToKVPoolHost,
     ReqToTokenPool,
     TokenToKVPoolAllocator,
 )
+
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 from sglang.srt.mem_cache.radix_cache import _key_match_page_size1 as _key_match
 from sglang.srt.mem_cache.memory_pool import MemoryStateInt
-from sglang.srt.mem_cache.eic_memory_pool import EICMHATokenToKVPoolHost, EICMLATokenToKVPoolHost
 from sglang.srt.managers.eic_cache_controller import EICCacheController
+from sglang.srt.mem_cache.eic_memory_pool import EICMHATokenToKVPoolHost, EICMLATokenToKVPoolHost
 
 
 logger = logging.getLogger(__name__)
@@ -34,23 +33,26 @@ class EICHiRadixCache(RadixCache):
         page_size: int,
         hicache_ratio: float,
     ):
-        if page_size != 1:
-            raise ValueError(
-                "Page size larger than 1 is not yet supported in EICHiRadixCache."
+        self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
+        if isinstance(self.kv_cache, MHATokenToKVPool):
+            self.token_to_kv_pool_host = EICMHATokenToKVPoolHost(
+                self.kv_cache, hicache_ratio, page_size
             )
-        
-        self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
-        if isinstance(self.token_to_kv_pool, MHATokenToKVPool):
-            self.token_to_kv_pool_host = EICMHATokenToKVPoolHost(self.token_to_kv_pool, hicache_ratio)
-        elif isinstance(self.token_to_kv_pool, MLATokenToKVPool):
-            self.token_to_kv_pool_host = EICMLATokenToKVPoolHost(self.token_to_kv_pool, hicache_ratio)
+        elif isinstance(self.kv_cache, MLATokenToKVPool):
+            self.token_to_kv_pool_host = EICMLATokenToKVPoolHost(
+                self.kv_cache, hicache_ratio, page_size
+            )
         else:
-            raise ValueError(f"Only MHA and MLA supports swap kv_cache to host.")
+            raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
+
+        self.tp_group = tp_cache_group
+
         self.load_cache_event = threading.Event()
         self.cache_controller = EICCacheController(
-            token_to_kv_pool_allocator, 
+            token_to_kv_pool_allocator,
             self.token_to_kv_pool_host,
-            self.load_cache_event
+            page_size,
+            load_cache_event=self.load_cache_event,
         )
 
         # record the nodes with ongoing write through
@@ -60,12 +62,8 @@ class EICHiRadixCache(RadixCache):
         # todo: dynamically adjust the threshold
         self.write_through_threshold = 1
         self.load_back_threshold = 10
-        self.tp_group = tp_cache_group
-        self.tp_size = self.tp_group.size()
-        self.page_size = page_size
-        
         super().__init__(
-            req_to_token_pool, token_to_kv_pool_allocator, self.page_size, disable=False
+            req_to_token_pool, token_to_kv_pool_allocator, page_size, disable=False
         )
 
     def reset(self):
@@ -116,17 +114,23 @@ class EICHiRadixCache(RadixCache):
 
     def writing_check(self):
         start_time = time.perf_counter()
-        while not self.cache_controller.ack_write_queue.empty():
-            try:
-                ack_id, success = self.cache_controller.ack_write_queue.get_nowait()
-                if not success:
-                    self.ongoing_write_through[ack_id].host_value = None
-                self.dec_lock_ref(self.ongoing_write_through[ack_id])
-                # clear the reference
-                del self.ongoing_write_through[ack_id]
-            except Exception as e:
-                logger.error(f"writing check error, exception {e.with_traceback(e.__traceback__)}")
-                break
+        queue_size = torch.tensor(
+            self.cache_controller.ack_write_queue.qsize(), dtype=torch.int
+        )
+        if torch.distributed.get_world_size(group=self.tp_group) > 1:
+            # synchrnoize TP workers to make the same update to radix cache
+            torch.distributed.all_reduce(
+                queue_size,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+        for _ in range(queue_size.item()):
+            ack_id, success = self.cache_controller.ack_write_queue.get()
+            if not success:
+                self.ongoing_write_through[ack_id].host_value = None
+            self.dec_lock_ref(self.ongoing_write_through[ack_id])
+            del self.ongoing_write_through[ack_id]
+
         check_cost = time.perf_counter() - start_time
         if check_cost > 0.001:
             logger.info(f"writing check cost {check_cost}")
@@ -159,12 +163,7 @@ class EICHiRadixCache(RadixCache):
     def evictable_size(self):
         return self.evictable_size_
 
-    def evict(self, num_tokens: int, evict_callback=None):
-        while len(self.ongoing_write_through) > 0 or len(self.ongoing_load_back) > 0:
-            self.writing_check()
-            self.loading_check()
-            time.sleep(0.1)
-
+    def evict(self, num_tokens: int):
         leaves = self._collect_leaves_device()
         heapq.heapify(leaves)
 
@@ -305,7 +304,8 @@ class EICHiRadixCache(RadixCache):
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
         if len(host_indices) < self.load_back_threshold or (
-            len(host_indices) > mem_quota + delta if mem_quota is not None else False
+            len(host_indices) > mem_quota +
+                delta if mem_quota is not None else False
         ):
             # skip loading back if the total size is too small or exceeding the memory quota
             self.dec_lock_ref(ancester_node)
@@ -327,7 +327,7 @@ class EICHiRadixCache(RadixCache):
         self.ongoing_load_back[last_hit_node.id] = (ancester_node, last_hit_node)
         offset = 0
         for node in nodes_to_load:
-            node.value = device_indices[offset : offset + len(node.host_value)]
+            node.value = device_indices[offset: offset + len(node.host_value)]
             offset += len(node.host_value)
             node.loading = True
         self.evictable_size_ += len(device_indices)
@@ -364,18 +364,26 @@ class EICHiRadixCache(RadixCache):
 
         return last_node, prefix_indices
 
-    def read_to_load_cache(self):
+    def ready_to_load_cache(self):
         self.load_cache_event.set()
 
     def match_prefix(self, key: List[int], include_evicted=False, **kwargs):
-        if self.disable:
-            return [], self.root_node
+        empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
+        if self.disable or len(key) == 0:
+            if include_evicted:
+                return empty_value, self.root_node, self.root_node
+            else:
+                return empty_value, self.root_node
+
+        if self.page_size != 1:
+            page_aligned_len = len(key) // self.page_size * self.page_size
+            key = key[:page_aligned_len]
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
             value = torch.cat(value)
         else:
-            value = torch.tensor([], dtype=torch.int64)
+            value = empty_value
 
         last_node_global = last_node
         while last_node.evicted:
@@ -388,11 +396,13 @@ class EICHiRadixCache(RadixCache):
 
     def _match_prefix_helper(self, node: TreeNode, key: List):
         node.last_access_time = time.time()
+        child_key = self.get_child_key_fn(key)
         value = []
-        while len(key) > 0 and key[0] in node.children.keys():
-            child = node.children[key[0]]
+
+        while len(key) > 0 and child_key in node.children.keys():
+            child = node.children[child_key]
             child.last_access_time = time.time()
-            prefix_len = _key_match(child.key, key)
+            prefix_len = self.key_match_fn(child.key, key)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 if not new_node.evicted:
@@ -404,12 +414,16 @@ class EICHiRadixCache(RadixCache):
                     value.append(child.value)
                 node = child
                 key = key[prefix_len:]
+
+                if len(key):
+                    child_key = self.get_child_key_fn(key)
+
         return value, node
 
     def _split_node(self, key, child: TreeNode, split_len: int):
         # child node split into new_node -> child
         new_node = TreeNode()
-        new_node.children = {key[split_len]: child}
+        new_node.children = {self.get_child_key_fn(key[split_len:]): child}
         new_node.parent = child.parent
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
@@ -426,7 +440,7 @@ class EICHiRadixCache(RadixCache):
             child.host_value = child.host_value[split_len:]
         child.parent = new_node
         child.key = child.key[split_len:]
-        new_node.parent.children[key[0]] = new_node
+        new_node.parent.children[self.get_child_key_fn(key)] = new_node
         return new_node
 
     def _insert_helper(self, node: TreeNode, key: List, value):
@@ -434,52 +448,53 @@ class EICHiRadixCache(RadixCache):
         if len(key) == 0:
             return 0
 
-        if key[0] in node.children.keys():
-            child = node.children[key[0]]
-            prefix_len = _key_match(child.key, key)
+        child_key = self.get_child_key_fn(key)
+        total_prefix_length = 0
 
-            if prefix_len == len(child.key):
-                if child.evicted:
+        while len(key) > 0 and child_key in node.children.keys():
+            node = node.children[child_key]
+            node.last_access_time = time.time()
+            prefix_len = self.key_match_fn(node.key, key)
+
+            if prefix_len == len(node.key):
+                if node.evicted:
                     # change the reference if the node is evicted
                     # this often happens in the case of KV cache recomputation
-                    child.value = value[:prefix_len]
-                    self.token_to_kv_pool_host.update_synced(child.host_value)
-                    self.evictable_size_ += len(value[:prefix_len])
-                    return self._insert_helper(
-                        child, key[prefix_len:], value[prefix_len:]
-                    )
+                    node.value = value[:prefix_len]
+                    self.token_to_kv_pool_host.update_synced(node.host_value)
+                    self.evictable_size_ += len(node.value)
                 else:
-                    self.inc_hit_count(child)
-                    return prefix_len + self._insert_helper(
-                        child, key[prefix_len:], value[prefix_len:]
-                    )
-
-            # partial match, split the node
-            new_node = self._split_node(child.key, child, prefix_len)
-            if new_node.evicted:
-                new_node.value = value[:prefix_len]
-                self.token_to_kv_pool_host.update_synced(new_node.host_value)
-                self.evictable_size_ += len(new_node.value)
-                return self._insert_helper(
-                    new_node, key[prefix_len:], value[prefix_len:]
-                )
+                    self.inc_hit_count(node)
+                    total_prefix_length += prefix_len
             else:
-                self.inc_hit_count(new_node)
-                return prefix_len + self._insert_helper(
-                    new_node, key[prefix_len:], value[prefix_len:]
-                )
+                # partial match, split the node
+                new_node = self._split_node(node.key, node, prefix_len)
+                if new_node.evicted:
+                    new_node.value = value[:prefix_len]
+                    self.token_to_kv_pool_host.update_synced(new_node.host_value)
+                    self.evictable_size_ += len(new_node.value)
+                else:
+                    self.inc_hit_count(new_node)
+                    total_prefix_length += prefix_len
+                node = new_node
+
+            key = key[prefix_len:]
+            value = value[prefix_len:]
+
+            if len(key):
+                child_key = self.get_child_key_fn(key)
 
         if len(key):
             new_node = TreeNode()
             new_node.parent = node
             new_node.key = key
             new_node.value = value
-            node.children[key[0]] = new_node
+            node.children[child_key] = new_node
             self.evictable_size_ += len(value)
 
             if self.cache_controller.write_policy == "write_through":
                 self.write_backup(new_node)
-        return 0
+        return total_prefix_length
 
     def _collect_leaves_device(self):
         def is_leaf(node):

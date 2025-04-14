@@ -349,9 +349,7 @@ class EICBaseTokenToKVPoolHost:
         self.dtype = device_pool.store_dtype
 
         # Initialize memory states and tracking structures.
-        self.mem_state = torch.zeros(
-            (self.size,), dtype=torch.uint8, device=self.device
-        )
+        self.mem_state = torch.zeros((self.size,), dtype=torch.uint8, device=self.device)
         self.free_slots = torch.arange(self.size, dtype=torch.int32)
         self.can_use_mem_size = self.size
 
@@ -520,6 +518,7 @@ class EICMHATokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         self,
         device_pool: MHATokenToKVPool,
         host_to_device_ratio: float = 2.0,
+        page_size: int = 1,
         device: str = "cpu",
         rank: int = 0,
     ):
@@ -540,6 +539,7 @@ class EICMLATokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         self,
         device_pool: MLATokenToKVPool,
         host_to_device_ratio: float = 2.0,
+        page_size: int = 1,
         device: str = "cpu",
         rank: int = 0,
     ):

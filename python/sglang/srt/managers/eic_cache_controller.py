@@ -16,6 +16,7 @@ class EICCacheController(HiCacheController):
         self,
         token_to_kv_pool_allocator: TokenToKVPoolAllocator,
         mem_pool_host: MHATokenToKVPoolHost,
+        page_size: int,
         load_cache_event: threading.Event = None,
         write_policy: str = "write_through",
     ):
@@ -23,7 +24,16 @@ class EICCacheController(HiCacheController):
         self.mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         self.mem_pool_host = mem_pool_host
         self.write_policy = write_policy
+        self.page_size = page_size
+
         self.load_cache_event = load_cache_event
+
+        if write_policy not in [
+            "write_through",
+            "write_through_selective",
+            "write_back",
+        ]:
+            raise ValueError(f"Invalid write policy: {write_policy}")
 
         self.write_queue = PriorityQueue()
         self.load_queue = PriorityQueue()
