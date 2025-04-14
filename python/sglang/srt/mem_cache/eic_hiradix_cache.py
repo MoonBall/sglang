@@ -112,8 +112,25 @@ class EICHiRadixCache(RadixCache):
             self.write_backup(node)
             node.hit_count = 0
 
+    def get_tp_result(self, flag):
+        if isinstance(flag, bool):
+            flag = [flag]
+        if self.tp_size <= 1:
+            return flag
+        # synchronize the result across TP workers
+        temp = [0 if x else 1 for x in flag]
+        temp_tensor = torch.tensor([temp], dtype=torch.int64, device="cpu")
+        torch.distributed.all_reduce(
+            temp_tensor, op=torch.distributed.ReduceOp.SUM, group=self.tp_group
+        )
+        result_list = temp_tensor.tolist()[0]
+        result = []
+        for i in range(len(result_list)):
+            result.append(result_list[i] == 0)
+        return result
+
+
     def writing_check(self):
-        start_time = time.perf_counter()
         queue_size = torch.tensor(
             self.cache_controller.ack_write_queue.qsize(), dtype=torch.int
         )
@@ -124,46 +141,66 @@ class EICHiRadixCache(RadixCache):
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.tp_group,
             )
+        ack_list = []
+        flags = []
         for _ in range(queue_size.item()):
-            ack_id, success = self.cache_controller.ack_write_queue.get()
+            ack_id, success = self.cache_controller.ack_write_queue.get_nowait()
+            ack_list.append(ack_id)
+            flags.append(success)
+        flags = self.get_tp_result(flags)
+        for ack_id, success in zip(ack_list, flags):
+            success = self.get_tp_result(success)
             if not success:
                 self.ongoing_write_through[ack_id].host_value = None
             self.dec_lock_ref(self.ongoing_write_through[ack_id])
+            # clear the reference
             del self.ongoing_write_through[ack_id]
 
-        check_cost = time.perf_counter() - start_time
-        if check_cost > 0.001:
-            logger.info(f"writing check cost {check_cost}")
 
     def loading_check(self):
-        start_time = time.perf_counter()
-        while not self.cache_controller.ack_load_queue.empty():
-            try:
-                ack_id, success = self.cache_controller.ack_load_queue.get_nowait()
-                start_node, end_node = self.ongoing_load_back[ack_id]
-                self.dec_lock_ref(end_node)
-                while end_node != start_node:
-                    assert end_node.loading
-                    if not success:
-                        self.cache_controller.mem_pool_device_allocator.free(end_node.value)
-                        self.evictable_size_ -= len(end_node.value)
-                        end_node.value = None
-                    end_node.loading = False
-                    end_node = end_node.parent
-                # clear the reference
-                del self.ongoing_load_back[ack_id]
-            except Exception as e:
-                logger.error(f"loading check error, exception {e.with_traceback(e.__traceback__)}")
-                break
-        check_cost = time.perf_counter() - start_time
-        if check_cost > 0.001:
-            logger.info(f"loading check cost {check_cost}")
+        queue_size = torch.tensor(
+            self.cache_controller.ack_load_queue.qsize(), dtype=torch.int
+        )
+        if torch.distributed.get_world_size(group=self.tp_group) > 1:
+            # synchrnoize TP workers to make the same update to radix cache
+            torch.distributed.all_reduce(
+                queue_size,
+                op=torch.distributed.ReduceOp.MIN,
+                group=self.tp_group,
+            )
+        ack_list = []
+        flags = []
+        for _ in range(queue_size.item()):
+            ack_id, success = self.cache_controller.ack_load_queue.get_nowait()
+            ack_list.append(ack_id)
+            flags.append(success)
+        flags = self.get_tp_result(flags)
+        for ack_id, success in zip(ack_list, flags):
+            ack_id, success = self.cache_controller.ack_load_queue.get_nowait()
+            start_node, end_node = self.ongoing_load_back[ack_id]
+            self.dec_lock_ref(end_node)
+            while end_node != start_node:
+                assert end_node.loading
+                if not success:
+                    self.cache_controller.mem_pool_device_allocator.free(end_node.value)
+                    self.evictable_size_ -= len(end_node.value)
+                    end_node.value = None
+                end_node.loading = False
+                end_node = end_node.parent
+            # clear the reference
+            del self.ongoing_load_back[ack_id]
+
 
     # TODO: is not correct for eic, but neednt to be fixed rightnow
     def evictable_size(self):
         return self.evictable_size_
 
-    def evict(self, num_tokens: int):
+    def evict(self, num_tokens: int, evict_callback=None):
+        while len(self.ongoing_write_through) > 50 or len(self.ongoing_load_back) > 50:
+            self.writing_check()
+            self.loading_check()
+            time.sleep(0.1)
+
         leaves = self._collect_leaves_device()
         heapq.heapify(leaves)
 
