@@ -11,6 +11,8 @@ import threading
 logger = logging.getLogger(__name__)
 TensorPoolSize = 1024
 
+REMOTE_EIC_YAML_ENV_VAR = "REMOTE_EIC_YAML"
+
 class FlexibleTensorSizePool:
     def __init__(self, conn, device: str):
         self.block_pools = {}
@@ -101,7 +103,12 @@ class EICKVClient:
     """
 
     def __init__(self, endpoint: str, kv_cache_dtype, kv_cache_shape, device="cpu"):
-        config_file = '/sgl-workspace/config/remote-eic.yaml'
+        if os.environ.get(REMOTE_EIC_YAML_ENV_VAR) is not None:
+            logger.info(f"eic init with env var {REMOTE_EIC_YAML_ENV_VAR}")
+            config_file = os.environ.get(REMOTE_EIC_YAML_ENV_VAR)
+        else:
+            config_file = '/sgl-workspace/config/remote-eic.yaml'
+            logger.info(f"eic init with default config, config_file {config_file}")
 
         if os.path.exists(config_file) is False:
             logger.error(f'config file {config_file} not exists')
@@ -136,7 +143,8 @@ class EICKVClient:
         eic_flag_file = config.get("eic_flag_file", None)
         logger.info(f'eic flag_file: {eic_flag_file}')
 
-        os.makedirs(eic_log_dir, exist_ok=True)
+        if not os.path.exists(eic_log_dir) and not os.path.isdir(eic_log_dir):
+            os.makedirs(eic_log_dir, exist_ok=True)
 
         self.connection = eic.Client()
         init_option = eic.InitOption()
