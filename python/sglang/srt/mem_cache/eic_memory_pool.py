@@ -383,16 +383,14 @@ class EICBaseTokenToKVPoolHost:
             key = keys[i:i+bs]
             objs, success_mask = self.eic_client.batch_get(key)
             if objs is None:
-                logger.error(
-                    f"get_flat_data keys {key} failed, eic_client return none")
+                logger.error(f"get_flat_data keys {key} failed, eic_client return none")
                 return None, []
             copy_objs = objs.clone()
             ret.extend([copy_objs[i] for i in range(copy_objs.shape[0])])
             masks.extend(success_mask)
 
         if len(ret) == 0:
-            logger.error(
-                f"get_flat_data keys size {len(keys)} failed, eic_client return none, ret {ret}")
+            logger.error(f"get_flat_data keys size {len(keys)} failed, eic_client return none, ret {ret}")
             return None, []
 
         flat_data = torch.stack(ret, dim=self.split_dim)
@@ -551,6 +549,3 @@ class EICMLATokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         self.kvcache_shape = (self.layer_num, 1, self.kv_lora_rank + self.qk_rope_head_dim)
         self.eic_client = EICKVClient(None, self.dtype, self.kvcache_shape, device_pool.device)
         self.split_dim = 1
-
-
-

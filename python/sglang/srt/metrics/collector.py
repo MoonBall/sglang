@@ -29,6 +29,9 @@ class SchedulerStats:
     spec_accept_length: float = 0.0
     avg_request_queue_latency: float = 0.0
 
+    total_num_tokens: int = 0
+    total_hit_num_tokens: int = 0
+
 
 class SchedulerMetricsCollector:
 

@@ -1150,6 +1150,9 @@ class Scheduler(
         )
 
         num_new_seq = len(can_run_list)
+        self.stats.total_num_tokens += adder.log_input_tokens
+        self.stats.total_hit_num_tokens += adder.log_hit_tokens
+
         f = (
             f"Prefill batch. "
             f"#new-seq: {num_new_seq}, "
@@ -1172,7 +1175,7 @@ class Scheduler(
             f += (
                 f"#write-queue: {num_write_queue_size}, "
                 f"#load-queue: {num_load_queue_size}, "
-                f"#cache_hit_rate: {adder.log_hit_tokens / (adder.log_input_tokens + adder.log_hit_tokens):.2f}"
+                f"#total_hit_rate: {self.stats.total_hit_num_tokens / self.stats.total_num_tokens:.2f}"
             )
         logger.info(f)
 
