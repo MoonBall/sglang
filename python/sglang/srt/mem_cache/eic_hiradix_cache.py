@@ -46,6 +46,7 @@ class EICHiRadixCache(RadixCache):
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
 
         self.tp_group = tp_cache_group
+        self.tp_size = self.tp_group.size()
 
         self.load_cache_event = threading.Event()
         self.cache_controller = EICCacheController(

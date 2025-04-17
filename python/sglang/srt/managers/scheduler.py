@@ -1175,7 +1175,7 @@ class Scheduler(
             f += (
                 f"#write-queue: {num_write_queue_size}, "
                 f"#load-queue: {num_load_queue_size}, "
-                f"#total_hit_rate: {self.stats.total_hit_num_tokens / self.stats.total_num_tokens:.2f}"
+                f"#hit_rate: {self.stats.total_hit_num_tokens / self.stats.total_num_tokens:.2f}"
             )
         logger.info(f)
 
