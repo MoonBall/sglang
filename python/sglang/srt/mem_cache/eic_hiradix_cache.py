@@ -120,11 +120,11 @@ class EICHiRadixCache(RadixCache):
             return flag
         # synchronize the result across TP workers
         temp = [0 if x else 1 for x in flag]
-        temp_tensor = torch.tensor([temp], dtype=torch.int64, device="cpu")
+        temp_tensor = torch.tensor(temp, dtype=torch.int64, device="cpu")
         torch.distributed.all_reduce(
             temp_tensor, op=torch.distributed.ReduceOp.SUM, group=self.tp_group
         )
-        result_list = temp_tensor.tolist()[0]
+        result_list = temp_tensor.tolist()
         result = []
         for i in range(len(result_list)):
             result.append(result_list[i] == 0)
@@ -150,7 +150,6 @@ class EICHiRadixCache(RadixCache):
             flags.append(success)
         flags = self.get_tp_result(flags)
         for ack_id, success in zip(ack_list, flags):
-            success = self.get_tp_result(success)
             if not success:
                 self.ongoing_write_through[ack_id].host_value = None
             self.dec_lock_ref(self.ongoing_write_through[ack_id])
@@ -177,7 +176,6 @@ class EICHiRadixCache(RadixCache):
             flags.append(success)
         flags = self.get_tp_result(flags)
         for ack_id, success in zip(ack_list, flags):
-            ack_id, success = self.cache_controller.ack_load_queue.get_nowait()
             start_node, end_node = self.ongoing_load_back[ack_id]
             self.dec_lock_ref(end_node)
             while end_node != start_node:
