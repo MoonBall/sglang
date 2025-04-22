@@ -87,6 +87,7 @@ async def async_request_openai_completions(
             "ignore_eos": not args.disable_ignore_eos,
             **request_func_input.extra_request_body,
         }
+
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
@@ -149,7 +150,7 @@ async def async_request_openai_completions(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["usage"] is not None and len(data["usage"]) > 0:
+                            if data.get("usage") is not None and len(data["usage"]) > 0:
                                 actual_prompt_len = data["usage"]["prompt_tokens"]
                                 actual_output_len = data["usage"]["completion_tokens"]
                                 continue

@@ -199,7 +199,9 @@ def sample_eic_dataset(
     disable_shuffle: bool = False,
     conversation_round: Optional[int] = None,
     conversation_context_length: Optional[int] = None,
-    fixed_output_len: Optional[int] = 1024
+    fixed_output_len: Optional[int] = 1024,
+    enable_shared_prefix: bool = True,
+    enable_multiturn: bool = False,
 ) -> SampleOutput:
     if fixed_output_len is not None and fixed_output_len < 4:
         raise ValueError("output_len too small")
@@ -220,20 +222,17 @@ def sample_eic_dataset(
     # TODO: Add shared prefix support for loogle
     # NOTE: Now we preprocess it only for chat
     total_context_length = 0
-    total_question_num = 0
 
     new_dataset = []
-    question_pair = {}
     doc_ids = set()
+    actual_num_requests = 0
     for data in dataset:
-        chat = []
         context = data['context']
         answer = data['answer']
         doc_id = data['doc_id']
         doc_ids.add(doc_id)
 
-        if len(doc_ids) > num_requests:
-            print(f"num_requests {len(new_dataset)}, doc_ids {len(doc_ids)}")
+        if actual_num_requests >= num_requests:
             break
 
         Questions = ["Question: Please summarize the input",
@@ -245,35 +244,44 @@ def sample_eic_dataset(
             for i in range(len(Questions), conversation_round, 1):
                 Questions.append(
                     f"Question {i}: Please tell me the main point of this Doc")
+        else:
+            Questions = Questions[:conversation_round]
         prefix_len = conversation_context_length
+        truncated_context = context[:prefix_len]
 
-        for question in Questions:
-            chat.append((f"DocID {doc_id}\n Input: " +
-                        context[:prefix_len] + "\n" + question, ' '.join(answer)))
-            if doc_id not in question_pair:
-                question_pair[doc_id] = []
-            question_pair[doc_id].append(
-                (f"DocID {doc_id}\nInput: " + context[:prefix_len] + "\n" + question, ' '))
-            total_context_length += len(context[:prefix_len])
-            total_question_num += 1
+        def make_context_question(
+            question: str
+        ) -> str:
+            return (
+                f"DocID {doc_id}\n"
+                f"Input: {truncated_context}\n"
+                f"{question}"
+        )
 
-        new_dataset.append(chat)
+        if enable_multiturn:
+            chat = []
+            for index, question in enumerate(Questions):
+                if actual_num_requests >= num_requests:
+                    break
+                total_context_length += len(truncated_context)
+                chat.append((make_context_question(question) if index == 0 else question, answer))
+                actual_num_requests += 1
+            new_dataset.append(chat)
+        else:
+            for question in Questions:
+                if actual_num_requests >= num_requests:
+                    break
+                new_dataset.append([(make_context_question(question), answer)])
+                actual_num_requests += 1
 
-    temp_dataset = []
-    for i in range(conversation_round):
-        for key, value in question_pair.items():
-            if i < len(value):
-                temp_dataset.append([value[i]])
-
-    new_dataset = temp_dataset
-    num_requests = len(new_dataset)
     # Filter out sequences that are too long or too short
     filtered_dataset: SampleOutput = common_filter_chat(
-        num_requests, new_dataset, tokenizer, 4, None, None, None, fixed_output_len
+        len(new_dataset), new_dataset, tokenizer, 4, None, None, None, fixed_output_len
     )
 
-    print(
-        f"total context length {total_context_length}, total question num {total_question_num}, avg question {total_context_length / max(total_question_num, 1)}")
+    if not enable_multiturn:
+        print(
+            f"total context length {total_context_length}, total question num {num_requests}, avg question {total_context_length / max(num_requests, 1)}")
     return filtered_dataset
 
 
@@ -645,6 +653,8 @@ def get_dataset(args, tokenizer):
             disable_shuffle=args.disable_shuffle,
             conversation_round=args.conversation_round,
             conversation_context_length=args.conversation_context_length,
+            enable_multiturn=args.enable_multiturn,
+            enable_shared_prefix=args.enable_shared_prefix,
             fixed_output_len=args.fixed_output_len,
         )
     elif args.dataset_name == "nextqa":
