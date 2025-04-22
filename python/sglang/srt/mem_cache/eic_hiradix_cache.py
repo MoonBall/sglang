@@ -132,6 +132,7 @@ class EICHiRadixCache(RadixCache):
 
 
     def writing_check(self):
+        write_check_start_time = time.perf_counter()
         queue_size = torch.tensor(
             self.cache_controller.ack_write_queue.qsize(), dtype=torch.int
         )
@@ -155,9 +156,16 @@ class EICHiRadixCache(RadixCache):
             self.dec_lock_ref(self.ongoing_write_through[ack_id])
             # clear the reference
             del self.ongoing_write_through[ack_id]
+        cost_time = time.perf_counter() - write_check_start_time
+        if cost_time > 0.1:
+            logger.warning(
+                f"writing check cost {cost_time:.3f} seconds, "
+                f"queue size {queue_size.item()}"
+            )
 
 
     def loading_check(self):
+        load_check_start_time = time.perf_counter()
         queue_size = torch.tensor(
             self.cache_controller.ack_load_queue.qsize(), dtype=torch.int
         )
@@ -188,6 +196,12 @@ class EICHiRadixCache(RadixCache):
                 end_node = end_node.parent
             # clear the reference
             del self.ongoing_load_back[ack_id]
+        cost_time = time.perf_counter() - load_check_start_time
+        if cost_time > 0.1:
+            logger.warning(
+                f"load check cost {cost_time:.3f} seconds, "
+                f"queue size {queue_size.item()}"
+            )
 
 
     # TODO: is not correct for eic, but neednt to be fixed rightnow
@@ -198,7 +212,7 @@ class EICHiRadixCache(RadixCache):
         while len(self.ongoing_write_through) > 50 or len(self.ongoing_load_back) > 50:
             self.writing_check()
             self.loading_check()
-            time.sleep(0.1)
+            time.sleep(0.001)
 
         leaves = self._collect_leaves_device()
         heapq.heapify(leaves)

@@ -13,39 +13,6 @@ TensorPoolSize = 1024
 
 REMOTE_EIC_YAML_ENV_VAR = "REMOTE_EIC_YAML"
 
-class FlexibleTensorSizePool:
-    def __init__(self, conn, device: str):
-        self.block_pools = {}
-        self.block_pool_idx = {}
-
-        self._init = False
-        self.connection = conn
-
-        self.device = 'cpu'
-        self.total_size = 0
-
-    def make_key(self, size, dtype):
-        return f"{size}_{dtype}"
-
-    def get_item_with_shape(self, size, dtype):
-        key = self.make_key(size, dtype)
-        if key not in self.block_pools:
-            self.block_pools[key] = [self.add_item(
-                size, dtype, self.device) for _ in range(TensorPoolSize)]
-            self.block_pool_idx[key] = 0
-            logger.info(
-                f"add new item shape {key}, total_size {self.total_size}")
-
-        ret = self.block_pools[key][self.block_pool_idx[key]]
-        self.block_pool_idx[key] = (
-            self.block_pool_idx[key] + 1) % TensorPoolSize
-        return ret
-
-    def add_item(self, size, dtype, device):
-        item = torch.zeros((size,), device=device, dtype=dtype)
-        self.total_size += item.numel() * item.element_size()
-        return item
-
 class FlexibleKVCacheMemoryPool:
     def __init__(self, conn, device: str, kv_cache_shape, kv_cache_dtype):
         self._init = False
@@ -160,12 +127,12 @@ class EICKVClient:
         self.device = device
 
         self.trans_type = eic.TransportType(eic_trans_type)
-        self.shape_mem_pool = FlexibleTensorSizePool(
-            self.connection, self.device)
 
         self.kv_cache_shape = kv_cache_shape
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_cache_mem_pool = FlexibleKVCacheMemoryPool(
+            self.connection, self.device, self.kv_cache_shape, self.kv_cache_dtype)
+        self.kv_cache_write_mem_pool = FlexibleKVCacheMemoryPool(
             self.connection, self.device, self.kv_cache_shape, self.kv_cache_dtype)
 
     def exists(self, key: str) -> bool:
@@ -295,22 +262,27 @@ class EICKVClient:
         logger.debug(f"eic set {len(keys)} keys")
         keys_vec = eic.StringVector()
         vals_vec = eic.IOBuffers()
+        count = len(keys)
 
-        for key, value in zip(keys, obj_inputs):
-            if not value.is_cpu:
-                obj = self.shape_mem_pool.get_item_with_shape(value.numel(), value.dtype)
-                if obj is not None:
-                    obj = obj.reshape(value.shape)
-                    obj.copy_(value)
-                else:
-                    obj = value.cpu()
-            else:
-                obj = value
+        registered = False
+        items = self.kv_cache_write_mem_pool.try_allocate_kv_cache(self.kv_cache_shape, self.kv_cache_dtype, count)
+        if items is None:
+            objs = torch.empty((count, ) + self.kv_cache_shape, dtype=self.kv_cache_dtype, device='cpu')
+            logger.error("can not allocate tensor from pool")
+        else:
+            objs = items
+            registered = True
 
-            # set data key & value
+        for i, key in enumerate(keys):
+            temp = objs[i].reshape(obj_inputs[i].shape).contiguous()
+            temp.copy_(obj_inputs[i])
+
+            if temp.data_ptr() != objs[i].data_ptr():
+                registered = False
+                temp = temp.cpu()
+
             keys_vec.append(key)
-            vals_vec.append(obj.data_ptr(), obj.element_size()
-                        * obj.numel(), False)
+            vals_vec.append(temp.data_ptr(), temp.element_size() * temp.numel(), registered)
 
         # set options
         set_option = eic.SetOption()
@@ -406,11 +378,13 @@ class EICBaseTokenToKVPoolHost:
 
     def assign_flat_data(self, indices, flat_data):
         logger.debug(f"assign_flat_data indices {indices}")
+        start_time = time.perf_counter()
 
         keys = self._encode_key(indices)
-        flat_data = flat_data.to("cpu")
         values = torch.split(flat_data, 1, dim=self.split_dim)
         bs = TensorPoolSize
+
+        split_time = time.perf_counter()
 
         for i in range(0, len(keys), bs):
             key = keys[i:i+bs]
@@ -419,7 +393,9 @@ class EICBaseTokenToKVPoolHost:
             if not ret:
                 logger.error(f"assign_flat_data keys {key} failed, eic_client return none")
                 return False
-
+        cost_time = time.perf_counter() - split_time
+        if cost_time > 1:
+            logger.warning(f"finish assign flat data, total keys {len(keys)}, split time {split_time - start_time}, transfer time {cost_time}")
         return True
 
     @debug_timing

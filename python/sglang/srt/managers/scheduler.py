@@ -1175,7 +1175,7 @@ class Scheduler(
             f += (
                 f"#write-queue: {num_write_queue_size}, "
                 f"#load-queue: {num_load_queue_size}, "
-                f"#hit_rate: {self.stats.total_hit_num_tokens / self.stats.total_num_tokens:.2f}"
+                f"#hit_rate: {adder.log_hit_tokens / (adder.log_input_tokens + adder.log_hit_tokens):.2f}"
             )
         logger.info(f)
 
@@ -1244,7 +1244,7 @@ class Scheduler(
             num_write_queue_size = self.tree_cache.cache_controller.write_queue.qsize()
             num_load_queue_size = self.tree_cache.cache_controller.load_queue.qsize()
             msg += (
-                f", #write-queue: {num_write_queue_size}, "
+                f"#write-queue: {num_write_queue_size}, "
                 f"#load-queue: {num_load_queue_size}"
             )
 

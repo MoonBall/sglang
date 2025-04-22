@@ -490,7 +490,7 @@ class PrefillAdder:
                 if enable_eic_cache:
                     loading_check_start_ts = time.perf_counter()
                     while not self.tree_cache.loading_complete(req.last_node):
-                        time.sleep(0.1)
+                        time.sleep(0.01)
                     load_flag = 100 if (req.last_node.value is None) else 0
                     load_sucess = True
                     if self.tree_cache.tp_size > 1:
