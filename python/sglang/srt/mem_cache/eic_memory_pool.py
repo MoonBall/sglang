@@ -258,6 +258,27 @@ class EICKVClient:
                      get_data_execution_time)
         return objs, success_mask
 
+    def retry_set_without_gdr(self, keys: str, obj_inputs: torch.Tensor) -> None:
+        logger.debug(f"eic set {len(keys)} keys")
+        keys_vec = eic.StringVector()
+        vals_vec = eic.IOBuffers()
+
+        for key, obj in zip(keys, obj_inputs):
+            keys_vec.append(key)
+            vals_vec.append(obj.data_ptr(), obj.element_size() * obj.numel(), False)
+
+        # set options
+        set_option = eic.SetOption()
+        set_option.ns = ""
+        set_option.ttl_second = -1
+        status_code, set_outcome = self.connection.mset(keys_vec, vals_vec, set_option)
+        if status_code != eic.StatusCode.SUCCESS:
+            logger.error(f"eic mset {len(keys)} failed, status_code {status_code}")
+            return False
+        else:
+            logger.debug(f"eic mset {len(keys)} success")
+        return True
+
     def set(self, keys: str, obj_inputs: torch.Tensor) -> None:
         logger.debug(f"eic set {len(keys)} keys")
         keys_vec = eic.StringVector()
@@ -291,7 +312,24 @@ class EICKVClient:
         status_code, set_outcome = self.connection.mset(keys_vec, vals_vec, set_option)
         if status_code != eic.StatusCode.SUCCESS:
             logger.error(f"eic mset {len(keys)} failed, status_code {status_code}")
-            return False
+
+            retry_keys = []
+            retry_values = []
+            total_errors = 0
+            for i, err_code in enumerate(set_outcome.status_codes):
+                if err_code != eic.StatusCode.SUCCESS:
+                    total_errors += 1
+
+                if err_code == eic.StatusCode.GDR_TRANSFER_ERROR:
+                    retry_keys.append(keys[i])
+                    retry_values.append(obj_inputs[i])
+
+            # not all keys are gdr transfer error
+            if len(retry_keys) != total_errors:
+                logger.info(f"eic mset {len(keys)} failed, but not all keys are gdr transfer error, retry_keys {retry_keys}, total_errors {total_errors}")
+                return False
+
+            return self.retry_set_without_gdr(retry_keys, retry_values)
         else:
             logger.debug(f"eic mset {len(keys)} success")
 
@@ -300,12 +338,8 @@ class EICKVClient:
             logger.debug(f"set data key {len(keys)} success")
             return True
         else:
-            logger.error(
-                f"set data key {len(keys)} failed, err_code {err_code}")
+            logger.error(f"set data key {len(keys)} failed, err_code {err_code}")
             return False
-
-    def support_batched_get(self) -> bool:
-        return True
 
 class EICBaseTokenToKVPoolHost:
 

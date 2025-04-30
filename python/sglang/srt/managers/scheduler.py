@@ -1150,8 +1150,6 @@ class Scheduler(
         )
 
         num_new_seq = len(can_run_list)
-        self.stats.total_num_tokens += adder.log_input_tokens
-        self.stats.total_hit_num_tokens += adder.log_hit_tokens
 
         f = (
             f"Prefill batch. "
