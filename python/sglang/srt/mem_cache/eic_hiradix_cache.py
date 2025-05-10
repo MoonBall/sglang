@@ -32,15 +32,17 @@ class EICHiRadixCache(RadixCache):
         tp_cache_group: torch.distributed.ProcessGroup,
         page_size: int,
         hicache_ratio: float,
+        hicache_size: int,
+        hicache_write_policy: str,
     ):
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = EICMHATokenToKVPoolHost(
-                self.kv_cache, hicache_ratio, page_size
+                self.kv_cache, hicache_ratio, hicache_size, page_size
             )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = EICMLATokenToKVPoolHost(
-                self.kv_cache, hicache_ratio, page_size
+                self.kv_cache, hicache_ratio, hicache_size, page_size
             )
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
@@ -54,6 +56,7 @@ class EICHiRadixCache(RadixCache):
             self.token_to_kv_pool_host,
             page_size,
             load_cache_event=self.load_cache_event,
+            write_policy=hicache_write_policy,
         )
 
         # record the nodes with ongoing write through
@@ -61,7 +64,9 @@ class EICHiRadixCache(RadixCache):
         # record the node segments with ongoing load back
         self.ongoing_load_back = {}
         # todo: dynamically adjust the threshold
-        self.write_through_threshold = 1
+        self.write_through_threshold = (
+            1 if hicache_write_policy == "write_through" else 3
+        )
         self.load_back_threshold = 10
         super().__init__(
             req_to_token_pool, token_to_kv_pool_allocator, page_size, disable=False
