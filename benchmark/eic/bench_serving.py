@@ -756,14 +756,14 @@ def run_benchmark(args_: argparse.Namespace):
     # Dataset compatibility check
     if args.enable_multiturn:
         # TODO: Support multiturn for random
-        if args.dataset_name not in ["sharegpt", "ultrachat", "loogle", "nextqa", "eic"]:
+        if args.dataset_name not in ["sharegpt", "ultrachat", "loogle", "nextqa", "eic", "eic_multiturn"]:
             print(
                 "Multiturn conversation is only supported for sharegpt, ultrachat, loogle, and nextqa datasets."
             )
             sys.exit(1)
 
     if args.enable_shared_prefix:
-        if args.dataset_name not in ["loogle", "nextqa", "eic"]:
+        if args.dataset_name not in ["loogle", "nextqa", "eic", "eic_multiturn"]:
             print("Shared prefix is only supported for loogle and nextqa datasets.")
             sys.exit(1)
 
@@ -832,6 +832,7 @@ if __name__ == "__main__":
             "loogle",
             "nextqa",
             "eic",
+            "eic_multiturn",
         ],
         help="Name of the dataset to benchmark on.",
     )

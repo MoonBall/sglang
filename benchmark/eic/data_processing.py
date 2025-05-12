@@ -191,8 +191,94 @@ def sample_ultrachat_requests(
     )
     return filtered_dataset
 
-
 def sample_eic_dataset(
+    dataset_path,
+    num_requests,
+    tokenizer: PreTrainedTokenizerBase,
+    disable_shuffle: bool = False,
+    conversation_round: Optional[int] = None,
+    conversation_context_length: Optional[int] = None,
+    fixed_output_len: Optional[int] = 1024,
+    enable_shared_prefix: bool = True,
+    enable_multiturn: bool = False,
+) -> SampleOutput:
+    if fixed_output_len is not None and fixed_output_len < 4:
+        raise ValueError("output_len too small")
+
+    # Load the dataset
+    dataset = []
+    with open(dataset_path) as f:
+        while True:
+            line = f.readline()
+            if not line:
+                break
+            dataset.append(json.loads(line))
+
+    if not disable_shuffle:
+        random.shuffle(dataset)
+
+    # Keep one conversation in one list
+    # TODO: Add shared prefix support for loogle
+    # NOTE: Now we preprocess it only for chat
+    total_context_length = 0
+    total_question_num = 0
+
+    new_dataset = []
+    question_pair = {}
+    doc_ids = set()
+    for data in dataset:
+        chat = []
+        context = data['context']
+        answer = data['answer']
+        doc_id = data['doc_id']
+        doc_ids.add(doc_id)
+
+        if len(doc_ids) > num_requests:
+            print(f"num_requests {len(new_dataset)}, doc_ids {len(doc_ids)}")
+            break
+
+        Questions = ["Question: Please summarize the input",
+                     "Question: how do you think about the input?",
+                     "Question: tell me the main idea of the input",
+                     "Question: what is the input about?"]
+
+        if len(Questions) < conversation_round:
+            for i in range(len(Questions), conversation_round, 1):
+                Questions.append(
+                    f"Question {i}: Please tell me the main point of this Doc")
+        prefix_len = conversation_context_length
+
+        for question in Questions:
+            chat.append((f"DocID {doc_id}\n Input: " +
+                        context[:prefix_len] + "\n" + question, ' '.join(answer)))
+            if doc_id not in question_pair:
+                question_pair[doc_id] = []
+            question_pair[doc_id].append(
+                (f"DocID {doc_id}\nInput: " + context[:prefix_len] + "\n" + question, ' '))
+            total_context_length += len(context[:prefix_len])
+            total_question_num += 1
+
+        new_dataset.append(chat)
+
+    temp_dataset = []
+    for i in range(conversation_round):
+        for key, value in question_pair.items():
+            if i < len(value):
+                temp_dataset.append([value[i]])
+
+    new_dataset = temp_dataset
+    num_requests = len(new_dataset)
+    # Filter out sequences that are too long or too short
+    filtered_dataset: SampleOutput = common_filter_chat(
+        num_requests, new_dataset, tokenizer, 4, None, None, None, fixed_output_len
+    )
+
+    print(
+        f"total context length {total_context_length}, total question num {total_question_num}, avg question {total_context_length / max(total_question_num, 1)}")
+    return filtered_dataset
+
+
+def sample_eic_multiturn_dataset(
     dataset_path,
     num_requests,
     tokenizer: PreTrainedTokenizerBase,
@@ -647,6 +733,18 @@ def get_dataset(args, tokenizer):
         )
     elif args.dataset_name == "eic":
         input_requests = sample_eic_dataset(
+            dataset_path=args.dataset_path,
+            num_requests=args.num_prompts,
+            tokenizer=tokenizer,
+            disable_shuffle=args.disable_shuffle,
+            conversation_round=args.conversation_round,
+            conversation_context_length=args.conversation_context_length,
+            enable_multiturn=args.enable_multiturn,
+            enable_shared_prefix=args.enable_shared_prefix,
+            fixed_output_len=args.fixed_output_len,
+        )
+    elif args.dataset_name == "eic_multiturn":
+        input_requests = sample_eic_multiturn_dataset(
             dataset_path=args.dataset_path,
             num_requests=args.num_prompts,
             tokenizer=tokenizer,
