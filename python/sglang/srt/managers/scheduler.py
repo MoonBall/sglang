@@ -1160,6 +1160,15 @@ class Scheduler(
             f"#running-req: {running_bs}, "
         )
 
+        if self.enable_hierarchical_cache:
+            num_write_queue_size = self.tree_cache.cache_controller.write_queue.qsize()
+            num_load_queue_size = self.tree_cache.cache_controller.load_queue.qsize()
+            f += (
+                f"#write-queue: {num_write_queue_size}, "
+                f"#load-queue: {num_load_queue_size}, "
+                f"#hit_rate: {adder.log_hit_tokens / (adder.log_input_tokens + adder.log_hit_tokens):.2f}, "
+            )
+
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             f += f"#unbootstrapped-req: {len(self.disagg_prefill_bootstrap_queue.queue)}, "
             f += f"#queue-req: {len(self.waiting_queue)}, "
@@ -1167,14 +1176,6 @@ class Scheduler(
         else:
             f += f"#queue-req: {len(self.waiting_queue)}"
 
-        if self.enable_hierarchical_cache:
-            num_write_queue_size = self.tree_cache.cache_controller.write_queue.qsize()
-            num_load_queue_size = self.tree_cache.cache_controller.load_queue.qsize()
-            f += (
-                f"#write-queue: {num_write_queue_size}, "
-                f"#load-queue: {num_load_queue_size}, "
-                f"#hit_rate: {adder.log_hit_tokens / (adder.log_input_tokens + adder.log_hit_tokens):.2f}"
-            )
         logger.info(f)
 
         if self.enable_metrics:
@@ -1233,18 +1234,18 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
 
-        msg += (
-            f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
-            f"#queue-req: {len(self.waiting_queue)}"
-        )
-
         if self.enable_hierarchical_cache:
             num_write_queue_size = self.tree_cache.cache_controller.write_queue.qsize()
             num_load_queue_size = self.tree_cache.cache_controller.load_queue.qsize()
             msg += (
                 f"#write-queue: {num_write_queue_size}, "
-                f"#load-queue: {num_load_queue_size}"
+                f"#load-queue: {num_load_queue_size}, "
             )
+
+        msg += (
+            f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
+            f"#queue-req: {len(self.waiting_queue)}"
+        )
 
         logger.info(msg)
         if self.enable_metrics:

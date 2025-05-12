@@ -342,25 +342,19 @@ class EICKVClient:
             return False
 
 class EICBaseTokenToKVPoolHost:
-
     def __init__(
         self,
         device_pool: KVCache,
+        size_per_token: int,
         host_to_device_ratio: float = 4.0,
+        host_size: int = 10,
         device: str = "cpu",
         rank: int = 0,
     ):
-        assert (
-            host_to_device_ratio >= 1
-        ), "The eic memory should be larger than the device memory with the current protocol"
-        # todo, other ways of configuring the size
-
-        self.device_pool = device_pool
-        self.host_to_device_ratio = host_to_device_ratio
-        self.device = device
-
-        self.size = int(device_pool.size * host_to_device_ratio)
-        self.dtype = device_pool.store_dtype
+        if host_size > 0:
+            self.size = int(host_size * 1e9 // size_per_token)
+        else:
+            self.size = int(device_pool.size * host_to_device_ratio)
 
         # Initialize memory states and tracking structures.
         self.mem_state = torch.zeros((self.size,), dtype=torch.uint8, device=self.device)
@@ -411,7 +405,7 @@ class EICBaseTokenToKVPoolHost:
         return flat_data, masks
 
     def assign_flat_data(self, indices, flat_data):
-        logger.debug(f"assign_flat_data indices {indices}")
+        logger.debug(f"assign_flat_data indices {indices.shape}")
         start_time = time.perf_counter()
 
         keys = self._encode_key(indices)
@@ -533,37 +527,50 @@ class EICMHATokenToKVPoolHost(EICBaseTokenToKVPoolHost):
     def __init__(
         self,
         device_pool: MHATokenToKVPool,
-        host_to_device_ratio: float = 2.0,
-        page_size: int = 1,
+        host_to_device_ratio:float,
+        host_size: int,
+        page_size: int,
         device: str = "cpu",
         rank: int = 0,
     ):
-        super().__init__(device_pool, host_to_device_ratio, device, rank)
+        self.device_pool = device_pool
+        self.device = device
+        self.dtype = device_pool.store_dtype
+
         self.head_num = device_pool.head_num
         self.head_dim = device_pool.head_dim
         self.layer_num = device_pool.layer_num
         self.size_per_token = (
             self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
         )
+
+        super().__init__(device_pool, self.size_per_token,
+                         host_to_device_ratio, host_size, device, rank)
         self.kvcache_shape = (2, self.layer_num, self.head_num, self.head_dim)
         self.eic_client = EICKVClient(None, self.dtype, self.kvcache_shape, device_pool.device)
-
 
 
 class EICMLATokenToKVPoolHost(EICBaseTokenToKVPoolHost):
     def __init__(
         self,
         device_pool: MLATokenToKVPool,
-        host_to_device_ratio: float = 2.0,
-        page_size: int = 1,
+        host_to_device_ratio: float,
+        host_size: int,
+        page_size: int,
         device: str = "cpu",
         rank: int = 0,
     ):
-        super().__init__(device_pool, host_to_device_ratio, device, rank)
+        self.device_pool = device_pool
+        self.device = device
+        self.dtype = device_pool.store_dtype
+
         self.kv_lora_rank = self.device_pool.kv_lora_rank
         self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
         self.layer_num = self.device_pool.layer_num
         self.size_per_token = (self.kv_lora_rank + self.qk_rope_head_dim) * 1 * self.dtype.itemsize
+
+        super().__init__(device_pool, self.size_per_token,
+                         host_to_device_ratio, host_size, device, rank)
         self.kvcache_shape = (self.layer_num, 1, self.kv_lora_rank + self.qk_rope_head_dim)
         self.eic_client = EICKVClient(None, self.dtype, self.kvcache_shape, device_pool.device)
         self.split_dim = 1
