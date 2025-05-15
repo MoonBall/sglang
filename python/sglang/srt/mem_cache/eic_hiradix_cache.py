@@ -16,11 +16,47 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.radix_cache import RadixCache, TreeNode
 from sglang.srt.mem_cache.radix_cache import _key_match_page_size1 as _key_match
 from sglang.srt.mem_cache.memory_pool import MemoryStateInt
-from sglang.srt.managers.eic_cache_controller import EICCacheController
+from sglang.srt.managers.eic_cache_controller import EICCacheController, get_content_hash
 from sglang.srt.mem_cache.eic_memory_pool import EICMHATokenToKVPoolHost, EICMLATokenToKVPoolHost
+from sglang.srt.server_args import ServerArgs
 
 
 logger = logging.getLogger(__name__)
+
+class EICHiRadixCacheBuilder:
+    @staticmethod
+    def build(        
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        tp_cache_group: torch.distributed.ProcessGroup,
+        page_size: int,
+        hicache_ratio: float,
+        hicache_size: int,
+        hicache_write_policy: str,
+        server_args: ServerArgs,
+    ):
+        if page_size <= 1:
+            return EICHiRadixCache(
+                req_to_token_pool,
+                token_to_kv_pool_allocator,
+                tp_cache_group,
+                page_size,
+                hicache_ratio,
+                hicache_size,
+                hicache_write_policy,
+                server_args,
+            )
+        else:
+            return EICPagedHiRadixCache(
+                req_to_token_pool,
+                token_to_kv_pool_allocator,
+                tp_cache_group,
+                page_size,
+                hicache_ratio,
+                hicache_size,
+                hicache_write_policy,
+                server_args,
+            )
 
 
 class EICHiRadixCache(RadixCache):
@@ -34,21 +70,22 @@ class EICHiRadixCache(RadixCache):
         hicache_ratio: float,
         hicache_size: int,
         hicache_write_policy: str,
+        server_args: ServerArgs,
     ):
+        self.tp_group = tp_cache_group
+        self.tp_size = self.tp_group.size()
+        self.rank = self.tp_group.rank()
         self.kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = EICMHATokenToKVPoolHost(
-                self.kv_cache, hicache_ratio, hicache_size, page_size
+                self.kv_cache, hicache_ratio, hicache_size, "cpu", page_size, self.rank, extra_info=self.get_extra_info(server_args),
             )
         elif isinstance(self.kv_cache, MLATokenToKVPool):
             self.token_to_kv_pool_host = EICMLATokenToKVPoolHost(
-                self.kv_cache, hicache_ratio, hicache_size, page_size
+                self.kv_cache, hicache_ratio, hicache_size, "cpu", page_size, self.rank, extra_info=self.get_extra_info(server_args),
             )
         else:
             raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
-
-        self.tp_group = tp_cache_group
-        self.tp_size = self.tp_group.size()
 
         self.load_cache_event = threading.Event()
         self.cache_controller = EICCacheController(
@@ -71,6 +108,16 @@ class EICHiRadixCache(RadixCache):
         super().__init__(
             req_to_token_pool, token_to_kv_pool_allocator, page_size, disable=False
         )
+    
+    def get_extra_info(self, server_args: ServerArgs):
+        # TODO update when sglang support pp
+        extra_info = {
+            "model_path": server_args.model_path,
+            "world_size": self.tp_size,
+            "tp_rank": self.rank,
+            "framework": "sglang"
+        }
+        return extra_info
 
     def reset(self):
         TreeNode.counter = 0
@@ -170,7 +217,7 @@ class EICHiRadixCache(RadixCache):
 
 
     def loading_check(self):
-        load_check_start_time = time.perf_counter()
+        loading_check_start_time = time.perf_counter()
         queue_size = torch.tensor(
             self.cache_controller.ack_load_queue.qsize(), dtype=torch.int
         )
@@ -201,10 +248,10 @@ class EICHiRadixCache(RadixCache):
                 end_node = end_node.parent
             # clear the reference
             del self.ongoing_load_back[ack_id]
-        cost_time = time.perf_counter() - load_check_start_time
+        cost_time = time.perf_counter() - loading_check_start_time
         if cost_time > 0.1:
             logger.warning(
-                f"load check cost {cost_time:.3f} seconds, "
+                f"loading check cost {cost_time:.3f} seconds, "
                 f"queue size {queue_size.item()}"
             )
 
@@ -217,7 +264,7 @@ class EICHiRadixCache(RadixCache):
         while len(self.ongoing_write_through) > 50 or len(self.ongoing_load_back) > 50:
             self.writing_check()
             self.loading_check()
-            time.sleep(0.001)
+            time.sleep(0.1)
 
         leaves = self._collect_leaves_device()
         heapq.heapify(leaves)
@@ -575,3 +622,233 @@ class EICHiRadixCache(RadixCache):
                     if not cur_child.evicted:
                         stack.append(cur_child)
         return ret_list
+
+def _need_calculate_hash(node: TreeNode, page_size: int):
+    if node is None or node.key is None or len(node.key) == 0:
+        return False
+    return node.content_hash is None or len(node.key) // page_size != len(node.content_hash)
+
+class EICPagedHiRadixCache(EICHiRadixCache):
+    def __init__(
+        self,
+        req_to_token_pool: ReqToTokenPool,
+        token_to_kv_pool_allocator: TokenToKVPoolAllocator,
+        tp_cache_group: torch.distributed.ProcessGroup,
+        page_size: int,
+        hicache_ratio: float,
+        hicache_size: int,
+        hicache_write_policy: str,
+        server_args: ServerArgs,
+    ):
+        self.calculate_hash_fn = get_content_hash
+        self.load_remote_threshold = 100
+        super().__init__(
+            req_to_token_pool, token_to_kv_pool_allocator, tp_cache_group, page_size, hicache_ratio, hicache_size, hicache_write_policy, server_args
+        )
+    
+    def _calculate_content_hash(self, node: TreeNode):
+        if _need_calculate_hash(node.parent, self.page_size):
+            self._calculate_content_hash(node.parent)
+        if node.parent is not None and node.parent.content_hash is not None:
+            prev_node_hash = node.parent.content_hash[-1]
+        else:
+            prev_node_hash = None
+        node.content_hash = self.calculate_hash_fn(node.key, self.page_size, prev_node_hash)
+        
+
+    def _split_node(self, key, child: TreeNode, split_len: int):
+        assert split_len % self.page_size == 0, f"split_len {split_len} is not page aligned"
+        # child node split into new_node -> child
+        if _need_calculate_hash(child, self.page_size):
+            self._calculate_content_hash(child)
+        new_node = TreeNode()
+        new_node.children = {self.get_child_key_fn(key[split_len:]): child}
+        new_node.parent = child.parent
+        new_node.lock_ref = child.lock_ref
+        new_node.key = child.key[:split_len]
+        new_node.loading = child.loading
+        split_hash_nums = split_len // self.page_size
+        new_node.content_hash = child.content_hash[:split_hash_nums]
+        child.content_hash = child.content_hash[split_hash_nums:]
+
+        # split value and host value if exists
+        if child.evicted:
+            new_node.value = None
+        else:
+            new_node.value = child.value[:split_len]
+            child.value = child.value[split_len:]
+        if child.host_value is not None:
+            new_node.host_value = child.host_value[:split_len]
+            child.host_value = child.host_value[split_len:]
+        child.parent = new_node
+        child.key = child.key[split_len:]
+        new_node.parent.children[self.get_child_key_fn(key)] = new_node
+        return new_node
+    
+    def match_prefix_extend(self, key: List[int], last_node):
+        cache_prefix_len = 0
+        temp_node = last_node
+        while temp_node:
+            cache_prefix_len += len(temp_node.key)
+            temp_node = temp_node.parent
+        
+        # if the cache prefix is too long, or the remaining key is too short, we can skip loading from eic
+        if (len(key) - cache_prefix_len) < self.load_remote_threshold or cache_prefix_len / len(key) > 0.5:
+            return last_node
+
+        logger.debug(f"few cache in radix, try load from eic, cache len {cache_prefix_len}, total len {len(key)}")
+        need_compute_key = key[cache_prefix_len:]
+        eic_hash, eic_key = self.cache_controller.find_longest_prefix_in_eic(need_compute_key)
+        if self.tp_size > 1:
+            eic_hash_len_tensor = torch.tensor([len(eic_hash)], dtype=torch.int64, device="cpu")
+            torch.distributed.all_reduce(eic_hash_len_tensor, op=torch.distributed.ReduceOp.MIN, group=self.tp_group)
+            eic_hash_len = eic_hash_len_tensor.item()
+            eic_hash = eic_hash[:eic_hash_len]
+            eic_key = eic_key[:eic_hash_len * self.page_size]
+        if len(eic_key) / len(need_compute_key) < 0.3:
+            logger.debug(f"eic key is too short, skip loading from eic, eic cache len {len(eic_key)}, need compute key len {len(need_compute_key)}")
+            return last_node
+        load_node = TreeNode()
+        load_node.key = eic_key
+        load_node.content_hash = eic_hash
+        host_indices = self.cache_controller.host_allocate(len(eic_key))
+        if host_indices is None:
+            self.evict_host(len(eic_key))
+            host_indices = self.cache_controller.host_allocate(len(eic_key))
+            if host_indices is None:
+                return last_node
+        load_node.host_value = host_indices
+        self.cache_controller.mem_pool_host.update_backup(host_indices)
+        assert last_node.children.get(self.get_child_key_fn(eic_key)) is None, f"eic key {eic_key} already exists in radix cache"
+        logger.debug(f"load token from eic: {len(eic_key)}")
+        last_node.children[self.get_child_key_fn(eic_key)] = load_node
+        load_node.parent = last_node
+        return load_node
+    
+    def match_prefix(self, key: List[int], include_evicted=False, **kwargs):
+        empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
+        if self.disable or len(key) == 0:
+            if include_evicted:
+                return empty_value, self.root_node, self.root_node
+            else:
+                return empty_value, self.root_node
+
+        if self.page_size != 1:
+            page_aligned_len = len(key) // self.page_size * self.page_size
+            key = key[:page_aligned_len]
+
+        value, last_node = self._match_prefix_helper(self.root_node, key)
+        if value:
+            value = torch.cat(value)
+        else:
+            value = empty_value
+
+        # try to load from eic
+        last_node = self.match_prefix_extend(key, last_node)
+
+        last_node_global = last_node
+        while last_node.evicted:
+            last_node = last_node.parent
+
+        if include_evicted:
+            return value, last_node, last_node_global
+        else:
+            return value, last_node
+    def write_backup(self, node: TreeNode):
+        if _need_calculate_hash(node, self.page_size):
+            self._calculate_content_hash(node)
+        host_indices = self.cache_controller.write_page(
+            device_indices=node.value,
+            priority=-self.get_height(node),
+            node_id=node.id,
+            content_hash=node.content_hash,
+        )
+        if host_indices is None:
+            self.evict_host(len(node.value))
+            host_indices = self.cache_controller.write_page(
+                device_indices=node.value,
+                priority=-self.get_height(node),
+                node_id=node.id,
+                content_hash=node.content_hash,
+            )
+        if host_indices is not None:
+            node.host_value = host_indices
+            self.ongoing_write_through[node.id] = node
+            self.inc_lock_ref(node)
+        else:
+            return None
+
+        return len(host_indices)
+
+    def load_back(
+        self, node: TreeNode, mem_quota: Optional[int] = None
+    ) -> Optional[torch.Tensor]:
+        # todo: more loading policies
+
+        last_hit_node = node
+        nodes_to_load = []
+        while node.evicted:
+            assert (
+                node.backuped
+            ), "No backup available on evicted nodes, should not happen"
+            nodes_to_load.insert(0, node)
+            node = node.parent
+        else:
+            ancester_node = node
+
+        # protect the ancestor nodes from eviction
+        delta = self.inc_lock_ref(ancester_node)
+
+        # check if host indices is None
+        if self.tp_size > 1:
+            ancester_node_id_tensor = torch.tensor([ancester_node.id], dtype=torch.int64, device="cpu")
+            torch.distributed.all_reduce(ancester_node_id_tensor, op=torch.distributed.ReduceOp.SUM, group=self.tp_group)
+            if ancester_node_id_tensor.item() != ancester_node.id * self.tp_size:
+                logger.error(f"node id mismatch {ancester_node_id_tensor.item()} {ancester_node.id}")
+                self.dec_lock_ref(ancester_node)
+                return None
+        if any(n.host_value is None for n in nodes_to_load) or any(
+            self.cache_controller.mem_pool_host.get_state(n.host_value)
+            != MemoryStateInt.BACKUP for n in nodes_to_load
+        ):
+            logger.warning(
+                f"host value is None or not synced for node {last_hit_node.id}")
+            self.dec_lock_ref(ancester_node)
+            return None
+
+        # load it all or not at all
+        host_indices = torch.cat([n.host_value for n in nodes_to_load])
+        if len(host_indices) < self.load_back_threshold or (
+            len(host_indices) > mem_quota +
+                delta if mem_quota is not None else False
+        ):
+            # skip loading back if the total size is too small or exceeding the memory quota
+            self.dec_lock_ref(ancester_node)
+            return None
+        host_content_hash = []
+        for n in nodes_to_load:
+            host_content_hash.extend(n.content_hash)
+
+        device_indices = self.cache_controller.load_page(
+            host_indices=host_indices, node_id=last_hit_node.id, content_hash=host_content_hash
+        )
+        if device_indices is None:
+            self.evict(len(host_indices))
+            device_indices = self.cache_controller.load_page(
+                host_indices=host_indices, node_id=last_hit_node.id, content_hash=host_content_hash
+            )
+        self.dec_lock_ref(ancester_node)
+        if device_indices is None:
+            # no sufficient GPU memory to load back KV caches
+            return None
+
+        self.ongoing_load_back[last_hit_node.id] = (ancester_node, last_hit_node)
+        offset = 0
+        for node in nodes_to_load:
+            node.value = device_indices[offset: offset + len(node.host_value)]
+            offset += len(node.host_value)
+            node.loading = True
+        self.evictable_size_ += len(device_indices)
+        self.inc_lock_ref(last_hit_node)
+
+        return device_indices

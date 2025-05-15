@@ -1,4 +1,4 @@
-from .cache_controller import HiCacheController
+from sglang.srt.managers.cache_controller import HiCacheController, CacheOperation
 from queue import Empty, PriorityQueue, Queue
 import threading
 import torch
@@ -8,8 +8,48 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPoolHost,
     TokenToKVPoolAllocator,
 )
+import hashlib
+import pickle
+from typing import Iterable, Optional, List
 
 logger = logging.getLogger(__name__)
+
+
+def get_content_hash(content: Iterable, page_size:int, prev_hash: Optional[int] = None) -> List[int]:
+    """
+    Get the hash of the content.
+    """
+    def hash_func(input):
+        input_bytes = pickle.dumps(input, protocol=pickle.HIGHEST_PROTOCOL)
+        return int.from_bytes(hashlib.sha256(input_bytes).digest(),
+                            byteorder="big")
+    if prev_hash is None:
+        prev_hash = 0
+    result = []
+    for i in range(len(content) // page_size):
+        page = content[i * page_size:(i + 1) * page_size]
+        page_hash = hash_func((prev_hash, page))
+        prev_hash = page_hash
+        result.append(page_hash)
+    return result
+
+class EICCacheOperation(CacheOperation):
+    def __init__(
+        self,
+        host_indices: torch.Tensor,
+        device_indices: torch.Tensor,
+        node_id: int,
+        content_hash: Optional[List[int]] = None,
+        priority: Optional[int] = None,
+    ):
+        self.content_hash = content_hash
+        super().__init__(
+            host_indices=host_indices,
+            device_indices=device_indices,
+            node_id=node_id,
+            priority=priority,
+        )
+
 
 class EICCacheController(HiCacheController):
     def __init__(
@@ -25,7 +65,6 @@ class EICCacheController(HiCacheController):
         self.mem_pool_host = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
-
         self.load_cache_event = load_cache_event
 
         if write_policy not in [
@@ -87,6 +126,106 @@ class EICCacheController(HiCacheController):
             th.start()
         for th in self.load_thread_pool:
             th.start()
+    
+    def write_token_wise(self, operation: EICCacheOperation):
+        """
+        Write the KV cache to host memory.
+        """
+        operation.data = self.mem_pool_device.get_flat_data(
+            operation.device_indices
+        )
+        ret = self.mem_pool_host.transfer(operation.host_indices, operation.data)
+        if not ret:
+            logger.error(f"Failed to write to host memory {operation.node_ids}")
+            self.mem_pool_host.free(operation.host_indices)
+            for node_id in operation.node_ids:
+                if node_id != 0:
+                    self.ack_write_queue.put((node_id, False))
+            return
+        self.mem_pool_host.complete_io(operation.host_indices)
+        for node_id in operation.node_ids:
+            if node_id != 0:
+                self.ack_write_queue.put((node_id, True))
+
+    def load_token_wise(self, operation: EICCacheOperation):
+        """
+        Load the KV cache from host memory to device memory.
+        """
+        operation.data, mask = self.mem_pool_host.get_flat_data(
+            operation.host_indices
+        )
+        if operation.data is None:
+            logger.error(f"Failed to load from host memory {operation.node_ids}")
+            for node_id in operation.node_ids:
+                if node_id != 0:
+                    self.ack_load_queue.put((node_id, False))
+            return
+        self.mem_pool_device.transfer(
+            operation.device_indices, operation.data
+        )
+        self.mem_pool_host.complete_io(operation.host_indices)
+        for node_id in operation.node_ids:
+            if node_id != 0:
+                self.ack_load_queue.put((node_id, True))
+    def write_page_wise(self, operation: EICCacheOperation):
+        """
+        Write the KV cache to host memory.
+        """
+        assert len(operation.host_indices) == self.page_size * len(operation.content_hash)
+        operation.data = self.mem_pool_device.get_flat_data(
+            operation.device_indices
+        )
+        ret = self.mem_pool_host.assign_page_data(operation.content_hash, operation.data)
+        if not ret:
+            logger.error(f"Failed to write to host memory {operation.node_ids}")
+            self.mem_pool_host.free(operation.host_indices)
+            for node_id in operation.node_ids:
+                if node_id != 0:
+                    self.ack_write_queue.put((node_id, False))
+            return
+        self.mem_pool_host.complete_io(operation.host_indices)
+        for node_id in operation.node_ids:
+            if node_id != 0:
+                self.ack_write_queue.put((node_id, True))
+
+    def load_page_wise(self, operation: EICCacheOperation):
+        """
+        Load the KV cache from host memory to device memory.
+        """
+        assert len(operation.host_indices) == self.page_size * len(operation.content_hash)
+        operation.data, mask = self.mem_pool_host.get_page_data(
+            operation.content_hash
+        )
+        if operation.data is None:
+            logger.error(f"Failed to load from host memory {operation.node_ids}")
+            for node_id in operation.node_ids:
+                if node_id != 0:
+                    self.ack_load_queue.put((node_id, False))
+            return
+        self.mem_pool_device.transfer(
+            operation.device_indices, operation.data
+        )
+        self.mem_pool_host.complete_io(operation.host_indices)
+        for node_id in operation.node_ids:
+            if node_id != 0:
+                self.ack_load_queue.put((node_id, True))
+    def write_to_eic(self, operation: EICCacheOperation):
+        """
+        Write the KV cache to host memory.
+        """
+        if self.page_size == 1:
+            self.write_token_wise(operation)
+        else:
+            self.write_page_wise(operation)
+
+    def load_from_eic(self, operation: EICCacheOperation):
+        """
+        Load the KV cache from host memory to device memory.
+        """
+        if self.page_size == 1:
+            self.load_token_wise(operation)
+        else:
+            self.load_page_wise(operation)
 
     def write_thread_func_direct(self):
             """
@@ -99,21 +238,7 @@ class EICCacheController(HiCacheController):
                         operation = self.write_queue.get(block=True, timeout=1)
                         if self.write_policy == "write_through":
                             torch.cuda.synchronize()
-                        operation.data = self.mem_pool_device.get_flat_data(
-                            operation.device_indices
-                        )
-                        ret = self.mem_pool_host.transfer(operation.host_indices, operation.data)
-                        if not ret:
-                            logger.error(f"Failed to write to host memory {operation.node_ids}")
-                            self.mem_pool_host.free(operation.host_indices)
-                            for node_id in operation.node_ids:
-                                if node_id != 0:
-                                    self.ack_write_queue.put((node_id, False))
-                            continue
-                        self.mem_pool_host.complete_io(operation.host_indices)
-                        for node_id in operation.node_ids:
-                            if node_id != 0:
-                                self.ack_write_queue.put((node_id, True))
+                        self.write_to_eic(operation)
                     except Empty:
                         continue
                     except Exception as e:
@@ -133,33 +258,64 @@ class EICCacheController(HiCacheController):
                 # self.load_cache_event.clear()
                 try:
                     operation = self.load_queue.get(block=True, timeout=1)
-                    # time.sleep(18e-6 * len(operation.host_indices))
-                    get_flat_data_start_time = time.perf_counter()
-                    operation.data, mask = self.mem_pool_host.get_flat_data(
-                        operation.host_indices
-                    )
-                    # [2, 80, 1993, 1, 128]
-                    get_flat_data_end_time = time.perf_counter()
-                    cost_second = get_flat_data_end_time - get_flat_data_start_time
-                    logger.debug(f"load thread func finish get_flat_data, indices {operation.host_indices.shape} cost {cost_second}")
-                    if operation.data is None:
-                        logger.error(f"Failed to load from host memory {operation.node_ids}")
-                        for node_id in operation.node_ids:
-                            if node_id != 0:
-                                self.ack_load_queue.put((node_id, False))
-                        continue
-                    self.mem_pool_device.transfer(
-                        operation.device_indices, operation.data
-                    )
-                    load_transfer_end_time = time.perf_counter()
-                    cost_second = load_transfer_end_time - get_flat_data_end_time
-                    logger.debug(
-                        f"load thread func finish transfer, indices {operation.device_indices.shape} cost {cost_second}")
-                    self.mem_pool_host.complete_io(operation.host_indices)
-                    for node_id in operation.node_ids:
-                        if node_id != 0:
-                            self.ack_load_queue.put((node_id, True))
+                    self.load_from_eic(operation)
                 except Empty:
                     continue
                 except Exception as e:
                      logger.error(e, e.with_traceback(e.__traceback__))
+    
+    def host_allocate(self, size):
+        """
+        Allocate memory on the host.
+        """
+        return self.mem_pool_host.alloc(size)
+    
+    def find_longest_prefix_in_eic(self, prompt):
+        """
+        Find the longest prefix in the EIC cache.
+        """
+        if len(prompt) == 0:
+            return [], []
+        content_hash = get_content_hash(prompt, self.page_size)
+        exist_result = self.mem_pool_host.exist_page(content_hash)
+        return exist_result, prompt[: len(exist_result) * self.page_size]
+
+    def write_page(
+        self,
+        device_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = 0,
+        content_hash: List[int] = None,
+    ) -> Optional[torch.Tensor]:
+        """
+        Back up KV caches from device memory to host memory.
+        """
+        host_indices = self.mem_pool_host.alloc(len(device_indices))
+        if host_indices is None:
+            return None
+        self.mem_pool_host.protect_write(host_indices)
+        self.write_queue.put(
+            EICCacheOperation(host_indices, device_indices, node_id, content_hash, priority)
+        )
+        return host_indices
+
+    def load_page(
+        self,
+        host_indices: torch.Tensor,
+        priority: Optional[int] = None,
+        node_id: int = 0,
+        content_hash: List[int] = None,
+    ) -> Optional[torch.Tensor]:
+        """
+        Load KV caches from host memory to device memory.
+        """
+        device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
+        if device_indices is None:
+            return None
+        self.mem_pool_host.protect_load(host_indices)
+        # to ensure the device indices are ready before accessed by another CUDA stream
+        torch.cuda.current_stream().synchronize()
+        self.load_queue.put(
+            EICCacheOperation(host_indices, device_indices, node_id, content_hash, priority)
+        )
+        return device_indices

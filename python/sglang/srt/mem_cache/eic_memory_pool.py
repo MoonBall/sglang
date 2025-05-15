@@ -152,6 +152,21 @@ class EICKVClient:
             logger.debug(f"eic exists {key} failed, err_code {err_code}")
         return success
 
+    def exists_batch(self, keys: str) -> List[bool]:
+        logger.debug(f"eic exists {len(keys)}")
+        keys_vec = eic.StringVector()
+        for key in keys:
+            keys_vec.append(key)
+        exist_option = eic.ExistOption()
+        status_code, exist_outcome = self.connection.mexist(keys_vec, exist_option)
+        if status_code != eic.StatusCode.SUCCESS:
+            logger.error(f"eic exists {len(keys)} failed, status_code {status_code}")
+            return [False] * len(keys)
+        res = []
+        for err_code in exist_outcome.status_codes:
+            res.append(err_code == eic.StatusCode.SUCCESS)
+        return res
+
     def get(self, keys: str) -> Optional[torch.Tensor]:
         logger.debug(f"eic get {keys}")
 
@@ -342,19 +357,28 @@ class EICKVClient:
             return False
 
 class EICBaseTokenToKVPoolHost:
+
     def __init__(
         self,
         device_pool: KVCache,
-        size_per_token: int,
         host_to_device_ratio: float = 4.0,
         host_size: int = 10,
         device: str = "cpu",
+        page_size: int = 1,
         rank: int = 0,
+        extra_info: Optional[dict] = None,
     ):
+        self.device_pool = device_pool
+        self.host_to_device_ratio = host_to_device_ratio
+        self.device = device
+        self.dtype = device_pool.store_dtype
+        self.page_size = page_size
+        self.size_per_token = self.get_size_per_token()
         if host_size > 0:
-            self.size = int(host_size * 1e9 // size_per_token)
+            self.size = int(host_size * 1e9 // self.size_per_token)
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
+        self.size = self.size - (self.size % self.page_size)
 
         # Initialize memory states and tracking structures.
         self.mem_state = torch.zeros((self.size,), dtype=torch.uint8, device=self.device)
@@ -365,24 +389,36 @@ class EICBaseTokenToKVPoolHost:
         self.lock = threading.RLock()
         self.debug = logger.isEnabledFor(logging.DEBUG)
 
-        if torch.distributed.is_initialized():
-            self.rank = torch.distributed.get_rank()
-        else:
-            self.rank = rank
+        self.rank = rank
         self.host_ip = self._get_host_ip()
         self.split_dim = 2
+        self.extra_info = extra_info
+        self.deploy_key = self._get_deploy_info()
 
-    def _encode_key(self, indices):
+    def _encode_key_exclusive(self, indices):
         return [f"{self.host_ip}_{self.rank}_{index}" for index in indices.to("cpu").tolist()]
 
     def _get_host_ip(self):
         import socket
         return socket.gethostbyname(socket.gethostname())
+    
+    def _get_deploy_info(self):
+        model_path = self.extra_info.get("model_path", "fake_model_path")
+        world_size = self.extra_info.get("world_size", 1)
+        rank = self.extra_info.get("tp_rank", 0)
+        page_size = self.page_size
+        framework = self.extra_info.get("framework", "sglang")
+        deploy_key = f"{model_path}_{world_size}_{rank}_{page_size}@{framework}"
+        return deploy_key
+    
+    def _encode_key_shared(self, content_hashs):
+        return [f"{content_hash}@{self.deploy_key}" for content_hash in content_hashs]
+
 
     # TODO: catch exception
     def get_flat_data(self, indices) -> Tuple[Optional[torch.Tensor], List[bool]]:
         logger.debug(f"get_flat_data indices {indices}")
-        keys = self._encode_key(indices)
+        keys = self._encode_key_exclusive(indices)
         bs = TensorPoolSize
         ret = []
         masks = []
@@ -401,17 +437,17 @@ class EICBaseTokenToKVPoolHost:
             logger.error(f"get_flat_data keys size {len(keys)} failed, eic_client return none, ret {ret}")
             return None, []
 
-        flat_data = torch.stack(ret, dim=self.split_dim)
+        flat_data = torch.cat(ret, dim=self.split_dim)
         return flat_data, masks
 
     def assign_flat_data(self, indices, flat_data):
-        logger.debug(f"assign_flat_data indices {indices.shape}")
+        logger.debug(f"assign_flat_data indices {indices}")
         start_time = time.perf_counter()
 
-        keys = self._encode_key(indices)
+        keys = self._encode_key_exclusive(indices)
+        flat_data = flat_data.contiguous()
         values = torch.split(flat_data, 1, dim=self.split_dim)
         bs = TensorPoolSize
-
         split_time = time.perf_counter()
 
         for i in range(0, len(keys), bs):
@@ -424,6 +460,66 @@ class EICBaseTokenToKVPoolHost:
         cost_time = time.perf_counter() - split_time
         if cost_time > 1:
             logger.warning(f"finish assign flat data, total keys {len(keys)}, split time {split_time - start_time}, transfer time {cost_time}")
+        return True
+
+    def get_size_per_token(self):
+        self.head_num = self.device_pool.head_num
+        self.head_dim = self.device_pool.head_dim
+        self.layer_num = self.device_pool.layer_num
+
+        return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
+    
+    def exist_page(self, content_hashs):
+        keys = self._encode_key_shared(content_hashs)
+        ret = self.eic_client.exists_batch(keys)
+        res = []
+        for i, exist in enumerate(ret):
+            if exist:
+                res.append(content_hashs[i])
+            else:
+                break
+        return res
+    
+    def get_page_data(self, content_hashs):
+        logger.debug(f"get_flat_data content_hashs {content_hashs}")
+        keys = self._encode_key_shared(content_hashs)
+        bs = TensorPoolSize
+        ret = []
+        masks = []
+
+        for i in range(0, len(keys), bs):
+            key = keys[i:i+bs]
+            objs, success_mask = self.eic_client.batch_get(key)
+            if objs is None:
+                logger.error(f"get_flat_data keys {key} failed, eic_client return none")
+                return None, []
+            copy_objs = objs.clone()
+            ret.extend([copy_objs[i] for i in range(copy_objs.shape[0])])
+            masks.extend(success_mask)
+
+        if len(ret) == 0:
+            logger.error(f"get_flat_data keys size {len(keys)} failed, eic_client return none, ret {ret}")
+            return None, []
+
+        flat_data = torch.cat(ret, dim=self.split_dim)
+        return flat_data, masks
+
+    def assign_page_data(self, content_hashs, flat_data):
+        logger.debug(f"assign_flat_data hashs {content_hashs}")
+
+        keys = self._encode_key_shared(content_hashs)
+        flat_data = flat_data.contiguous()
+        values = torch.split(flat_data, self.page_size, dim=self.split_dim)
+        bs = TensorPoolSize
+
+        for i in range(0, len(keys), bs):
+            key = keys[i:i+bs]
+            value = values[i:i+bs]
+            ret = self.eic_client.set(key, value)
+            if not ret:
+                logger.error(f"assign_flat_data keys {key} failed, eic_client return none")
+                return False
+
         return True
 
     @debug_timing
@@ -478,7 +574,7 @@ class EICBaseTokenToKVPoolHost:
 
     @synchronized()
     def update_backup(self, indices: torch.Tensor):
-        assert self.is_synced(indices), (
+        assert self.is_synced(indices) or (self.page_size > 1 and self.is_reserved(indices)), (
             f"The host memory slots should be in SYNCED state before turning into BACKUP. "
             f"Current state: {self.get_state(indices)}"
         )
@@ -529,25 +625,22 @@ class EICMHATokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         device_pool: MHATokenToKVPool,
         host_to_device_ratio:float,
         host_size: int,
-        page_size: int,
-        device: str = "cpu",
-        rank: int = 0,
-    ):
-        self.device_pool = device_pool
-        self.device = device
-        self.dtype = device_pool.store_dtype
 
+        device: str = "cpu",
+        page_size: int = 1,
+        rank: int = 0,
+        extra_info: Optional[dict] = None,
+    ):
+        super().__init__(device_pool, host_to_device_ratio, host_size, device, page_size, rank, extra_info)
         self.head_num = device_pool.head_num
         self.head_dim = device_pool.head_dim
         self.layer_num = device_pool.layer_num
         self.size_per_token = (
             self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
         )
-
-        super().__init__(device_pool, self.size_per_token,
-                         host_to_device_ratio, host_size, device, rank)
-        self.kvcache_shape = (2, self.layer_num, self.head_num, self.head_dim)
+        self.kvcache_shape = (2, self.layer_num, page_size, self.head_num, self.head_dim)
         self.eic_client = EICKVClient(None, self.dtype, self.kvcache_shape, device_pool.device)
+
 
 
 class EICMLATokenToKVPoolHost(EICBaseTokenToKVPoolHost):
@@ -556,21 +649,28 @@ class EICMLATokenToKVPoolHost(EICBaseTokenToKVPoolHost):
         device_pool: MLATokenToKVPool,
         host_to_device_ratio: float,
         host_size: int,
-        page_size: int,
         device: str = "cpu",
+        page_size: int = 1,
         rank: int = 0,
+        extra_info: Optional[dict] = None,
     ):
-        self.device_pool = device_pool
-        self.device = device
-        self.dtype = device_pool.store_dtype
-
+        super().__init__(device_pool, host_to_device_ratio, host_size, device, page_size, rank, extra_info)
         self.kv_lora_rank = self.device_pool.kv_lora_rank
         self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
         self.layer_num = self.device_pool.layer_num
         self.size_per_token = (self.kv_lora_rank + self.qk_rope_head_dim) * 1 * self.dtype.itemsize
-
-        super().__init__(device_pool, self.size_per_token,
-                         host_to_device_ratio, host_size, device, rank)
-        self.kvcache_shape = (self.layer_num, 1, self.kv_lora_rank + self.qk_rope_head_dim)
+        self.kvcache_shape = (self.layer_num, page_size, 1, self.kv_lora_rank + self.qk_rope_head_dim)
         self.eic_client = EICKVClient(None, self.dtype, self.kvcache_shape, device_pool.device)
         self.split_dim = 1
+
+    def get_size_per_token(self):
+        self.kv_lora_rank = self.device_pool.kv_lora_rank
+        self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
+        self.layer_num = self.device_pool.layer_num
+
+        return (
+            (self.kv_lora_rank + self.qk_rope_head_dim)
+            * 1
+            * self.dtype.itemsize
+            * self.layer_num
+        )

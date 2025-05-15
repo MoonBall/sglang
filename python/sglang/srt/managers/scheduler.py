@@ -115,7 +115,7 @@ from sglang.srt.managers.tp_worker_overlap_thread import TpModelWorkerClient
 from sglang.srt.managers.utils import validate_input_length
 from sglang.srt.mem_cache.chunk_cache import ChunkCache
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
-from sglang.srt.mem_cache.eic_hiradix_cache import EICHiRadixCache
+from sglang.srt.mem_cache.eic_hiradix_cache import EICHiRadixCacheBuilder
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.metrics.collector import SchedulerMetricsCollector, SchedulerStats
 from sglang.srt.model_executor.forward_batch_info import (
@@ -507,7 +507,7 @@ class Scheduler(
             if self.enable_hierarchical_cache:
                 tp_cache_group = self.attn_tp_cpu_group if server_args.enable_dp_attention else self.tp_cpu_group
                 if self.enable_eic_cache:
-                    self.tree_cache = EICHiRadixCache(
+                    self.tree_cache = EICHiRadixCacheBuilder.build(
                         req_to_token_pool=self.req_to_token_pool,
                         token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                         tp_cache_group=tp_cache_group,
@@ -515,6 +515,7 @@ class Scheduler(
                         hicache_ratio=server_args.hicache_ratio,
                         hicache_size=server_args.hicache_size,
                         hicache_write_policy=server_args.hicache_write_policy,
+                        server_args=server_args,
                     )
                 else:
                     self.tree_cache = HiRadixCache(
