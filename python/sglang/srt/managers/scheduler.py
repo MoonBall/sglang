@@ -1235,7 +1235,7 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             msg += f"pre-allocated usage: {self.num_tokens_pre_allocated / self.max_total_num_tokens:.2f}, "
 
-        if self.enable_hierarchical_cache:
+        if self.enable_hierarchical_cache and not isinstance(self.tree_cache, ChunkCache):
             num_write_queue_size = self.tree_cache.cache_controller.write_queue.qsize()
             num_load_queue_size = self.tree_cache.cache_controller.load_queue.qsize()
             msg += (
