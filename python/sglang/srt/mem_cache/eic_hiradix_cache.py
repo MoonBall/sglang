@@ -135,6 +135,7 @@ class EICHiRadixCache(RadixCache):
         return height
 
     def write_backup(self, node: TreeNode):
+        logger.debug(f"write backup for node {node.id}")
         host_indices = self.cache_controller.write(
             device_indices=node.value,
             priority=-self.get_height(node),
@@ -203,7 +204,13 @@ class EICHiRadixCache(RadixCache):
             flags.append(success)
         flags = self.get_tp_result(flags)
         for ack_id, success in zip(ack_list, flags):
-            if not success:
+            if not success and self.ongoing_write_through[ack_id].host_value is not None:
+                if self.cache_controller.mem_pool_host.get_state(
+                    self.ongoing_write_through[ack_id].host_value
+                ) != MemoryStateInt.IDLE:
+                    self.cache_controller.mem_pool_host.free(
+                        self.ongoing_write_through[ack_id].host_value
+                    )
                 self.ongoing_write_through[ack_id].host_value = None
             self.dec_lock_ref(self.ongoing_write_through[ack_id])
             # clear the reference
@@ -300,10 +307,8 @@ class EICHiRadixCache(RadixCache):
                 elif self.cache_controller.write_policy == "write_through_selective":
                     num_evicted += self._evict_write_through_selective(x)
                 else:
-                    assert (
-                        self.cache_controller.write_policy != "write_through"
-                    ), "write_through should be inclusive"
-                    raise NotImplementedError
+                    # wright through but set eic failed
+                    num_evicted += self._evict_write_through_selective(x)
             else:
                 num_evicted += self._evict_write_through(x)
 
