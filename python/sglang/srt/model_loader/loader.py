@@ -64,7 +64,6 @@ from sglang.srt.utils import (
 
 import sglang.srt.model_loader.eic_utils as eic_utils
 
-from vllm import _custom_ops as ops
 from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_to_tensor_quant,
     normalize_e4m3fn_to_e4m3fnuz,
@@ -1419,6 +1418,7 @@ class EICModelLoader(BaseModelLoader):
 
             _, model_type = get_model_architecture(model_config)
             if not global_server_args_dict["disable_mla"] and model_type == "DeepseekV3ForCausalLM":
+                from vllm import _custom_ops as ops
                 logger.info("It's a DeepseekV3ForCausalLM model, we will do mla optimization.")
                 for layer_id in range(model.config.num_hidden_layers):
                     self_attn = model.model.layers[layer_id].self_attn
