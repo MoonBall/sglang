@@ -13,6 +13,12 @@ TensorPoolSize = 1024
 
 REMOTE_EIC_YAML_ENV_VAR = "REMOTE_EIC_YAML"
 
+# gpu direct rdma for kv set
+G_EnableKVSetGPUDirect = False
+
+# gpu direct rdma for kv get
+G_EnableKVGetGPUDirect = True
+
 class FlexibleKVCacheMemoryPool:
     def __init__(self, conn, device: str, kv_cache_shape, kv_cache_dtype):
         self._init = False
@@ -110,6 +116,17 @@ class EICKVClient:
         eic_flag_file = config.get("eic_flag_file", None)
         logger.info(f'eic flag_file: {eic_flag_file}')
 
+        G_EnableKVSetGPUDirect = config.get("enable_kvset_gpu_direct", False)
+        logger.info(f'eic enable_kvset_gpu_direct: {G_EnableKVSetGPUDirect}')
+
+        G_EnableKVGetGPUDirect = config.get("enable_kvget_gpu_direct", True)
+        logger.info(f'eic enable_kvget_gpu_direct: {G_EnableKVGetGPUDirect}')
+
+        # rdma write
+        enable_kv_set_direct = config.get("enable_kvset_direct", True)
+        logger.info(f'eic enable_kv_set_direct: {enable_kv_set_direct}')
+        self.enable_kv_set_direct = enable_kv_set_direct
+
         if not os.path.exists(eic_log_dir) and not os.path.isdir(eic_log_dir):
             os.makedirs(eic_log_dir, exist_ok=True)
 
@@ -131,9 +148,10 @@ class EICKVClient:
         self.kv_cache_shape = kv_cache_shape
         self.kv_cache_dtype = kv_cache_dtype
         self.kv_cache_mem_pool = FlexibleKVCacheMemoryPool(
-            self.connection, self.device, self.kv_cache_shape, self.kv_cache_dtype)
+            self.connection, self.device if G_EnableKVGetGPUDirect else 'cpu', self.kv_cache_shape, self.kv_cache_dtype)
+
         self.kv_cache_write_mem_pool = FlexibleKVCacheMemoryPool(
-            self.connection, self.device, self.kv_cache_shape, self.kv_cache_dtype)
+            self.connection, self.device if G_EnableKVSetGPUDirect else 'cpu', self.kv_cache_shape, self.kv_cache_dtype)
 
     def exists(self, key: str) -> bool:
         logger.debug(f"eic exists {key}")
@@ -318,7 +336,7 @@ class EICKVClient:
                 temp = temp.cpu()
 
             keys_vec.append(key)
-            vals_vec.append(temp.data_ptr(), temp.element_size() * temp.numel(), registered)
+            vals_vec.append(temp.data_ptr(), temp.element_size() * temp.numel(), registered and self.enable_kv_set_direct)
 
         # set options
         set_option = eic.SetOption()
@@ -401,7 +419,7 @@ class EICBaseTokenToKVPoolHost:
     def _get_host_ip(self):
         import socket
         return socket.gethostbyname(socket.gethostname())
-    
+
     def _get_deploy_info(self):
         model_path = self.extra_info.get("model_path", "fake_model_path")
         world_size = self.extra_info.get("world_size", 1)
@@ -410,7 +428,7 @@ class EICBaseTokenToKVPoolHost:
         framework = self.extra_info.get("framework", "sglang")
         deploy_key = f"{model_path}_{world_size}_{rank}_{page_size}@{framework}"
         return deploy_key
-    
+
     def _encode_key_shared(self, content_hashs):
         return [f"{content_hash}@{self.deploy_key}" for content_hash in content_hashs]
 
@@ -446,7 +464,11 @@ class EICBaseTokenToKVPoolHost:
 
         keys = self._encode_key_exclusive(indices)
         flat_data = flat_data.contiguous()
-        values = torch.split(flat_data, 1, dim=self.split_dim)
+        if not G_EnableKVSetGPUDirect:
+            values = torch.split(flat_data.cpu(), 1, dim=self.split_dim)
+        else:
+            values = torch.split(flat_data, 1, dim=self.split_dim)
+
         bs = TensorPoolSize
         split_time = time.perf_counter()
 
@@ -468,7 +490,7 @@ class EICBaseTokenToKVPoolHost:
         self.layer_num = self.device_pool.layer_num
 
         return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
-    
+
     def exist_page(self, content_hashs):
         keys = self._encode_key_shared(content_hashs)
         ret = self.eic_client.exists_batch(keys)
@@ -479,7 +501,7 @@ class EICBaseTokenToKVPoolHost:
             else:
                 break
         return res
-    
+
     def get_page_data(self, content_hashs):
         logger.debug(f"get_flat_data content_hashs {content_hashs}")
         keys = self._encode_key_shared(content_hashs)
